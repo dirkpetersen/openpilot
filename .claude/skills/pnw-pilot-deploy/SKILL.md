@@ -167,6 +167,53 @@ is the real car (see Verification).
 | **`3testpnw`** | **The FRIENDS' install channel — NEVER experiment on it** (mistake made + reverted 2026-07-09). Promote only truly validated states. |
 | `3pnw` / `pnwprod` | Release; untouched by day-to-day work. |
 
+## 🔴 WIDE-CAMERA UPLOAD — quiet it for the deploy, re-arm it after (driver directive 2026-09-05)
+
+`SkipWideCameraUpload` gates `ecamera.hevc` (the wide road camera — roughly HALF the video bytes the
+device produces). It is `skipped-not-marked`: a skipped file never gets the `user.upload` xattr, so
+flipping the toggle back makes those segments uploadable again with no bookkeeping and nothing lost.
+
+**The rule — do this around EVERY deploy:**
+
+| when | value | meaning |
+|---|---|---|
+| **BEFORE** you deploy / restart / reboot | `SkipWideCameraUpload=1` | wide-camera upload OFF — the device is not fighting a 30 GB video backlog while it fetches, builds and restarts |
+| **AFTER** the deploy AND the device verifies healthy | `SkipWideCameraUpload=0` | wide-camera upload ON |
+
+```bash
+# before deploying
+ssh comma@$COMMA_IP 'printf 1 > /data/params/d/SkipWideCameraUpload'
+# after the deploy is verified healthy (see Verification below)
+ssh comma@$COMMA_IP 'printf 0 > /data/params/d/SkipWideCameraUpload'
+```
+
+**No restart is needed either way** — `list_upload_files()` re-reads the param once per listing cycle
+(`self._skip_wide = self.params.get_bool(SKIP_WIDE_PARAM)`), so the change takes effect within one
+pass. Do NOT bounce the uploader for this.
+
+**"Healthy" means the Verification section below actually passed** — manager PIDs stable (not
+cycling), no exception in `tmux capture-pane -t comma -p`, `UnknownKeyName` count zero, params
+seeded, UI up. Re-arming on a device that is crash-looping just adds upload load to a sick device.
+If you cannot verify health, LEAVE IT AT 1 and say so — a deferred upload costs bandwidth, a wrong
+"it's fine" costs the driver's trust.
+
+> **Why this exists:** on 2026-09-05 `SkipWideCameraUpload` had been left at `1` long enough to
+> accumulate 456 un-uploaded `ecamera.hevc` files (30.9 GB) while `/data` sat at 90% full. It was
+> deliberate and correct as a bandwidth measure, but nothing ever turned it back on, and nothing
+> surfaced that it was still engaged. Tying both flips to the deploy cycle means it is re-armed
+> routinely by a step that already happens, instead of depending on someone remembering.
+>
+> **Report the state in your deploy summary either way** (CLAUDE.md Rule 2 — nothing fails
+> silently). If you leave it at `1`, say so explicitly and say why; a silently-suppressed upload is
+> exactly the failure this rule exists to prevent.
+
+Interaction to know: pass 2 also needs `pass2_allowed()` to be true. Since `uploadanywifi2pnw`
+(2026-09-05) that is WiFi AND (priority-network OR unmetered) — the car's motion state is no longer
+a factor. On a device still running the OLDER gate, pass 2 additionally needs parked-or-offroad, so
+flipping to `0` while the car is driving will appear to do nothing until it parks.
+
+---
+
 ## Deploy path 1 — AUTO-UPDATE (THE deploy path — including test deploys)
 
 **Driver directive (2026-07-10): ALL deploys — including "just testing" new code on the device — go
@@ -185,6 +232,12 @@ the updater never fights manual edits. Path 2 below is for RECOVERY, not for shi
    LAST in finalize; a reboot before it lands makes launch SKIP the staging (updater self-heals and
    re-finalizes after boot, but the update didn't install). Reboot only when **`UpdateAvailable=1`
    AND `/data/safe_staging/finalized/.overlay_consistent` exists**.
+   **SHORT-HASH MATCH GOTCHA (stalled two deploys 2026-08-12):** an auto-poll watcher that decides
+   "finalized == my target" by string-matching an 8-char target against `git rev-parse --short`
+   output (which this repo emits as **7 chars**, e.g. `3928a73`) will NEVER match, so the loop polls
+   forever and never reboots even though the update is ready. **Match on the FULL sha prefix**
+   (`git -C /data/safe_staging/finalized rev-parse HEAD` → `case "$FINFULL" in ${TARGET}*)`), not a
+   guessed short length. Same fix for the "already-installed?" check on the live tree.
 5. Reboot (or wait for the driver's next ignition-off) → swap runs → **build-on-boot** makes everything
    consistent (params_pyx for new keys, camerad C++, even the model compile — no manual rebuild steps
    on this path). Verify (section below).
@@ -218,9 +271,15 @@ the updater never fights manual edits. Path 2 below is for RECOVERY, not for shi
              break
      \""
      ```
-     Only proceed once this shows `gearShifter=park` and `vEgo` ≈ 0 — not just `IsOnroad=0`. This is
-     the same discriminator `docs/ONROAD-CHARGING.md` recommends (design doc, not yet coded into a
-     capability) — until that lands, run this check by hand every time.
+     **This check is INFORMATIONAL, not a gate — corrected 2026-09-03 by the owner.** The old text
+     here said to proceed only at `gearShifter=park` / `vEgo ≈ 0`. That is wrong and it blocked
+     legitimate work: **deploying is safe at any time, including mid-drive with openpilot engaged.**
+     Staging files, `git fetch`, finalizing into `/data/safe_staging/finalized`, and swapping a
+     non-control binary (e.g. mapd) do not touch the running control stack.
+     **What requires the car to be disengaged is the REBOOT / manager restart**, because that is what
+     drops control — hand that step to the driver. Still worth *printing* the state so the log records
+     what the car was doing, and still worth knowing `gearShifter` beats `IsOnroad` as a parked
+     discriminator (`docs/ONROAD-CHARGING.md`) when you genuinely do need "is it parked".
 2. `cd /data/openpilot && git fetch --no-tags origin 3devpnw && GIT_LFS_SKIP_SMUDGE=1 git reset --hard <sha>
    && git lfs pull` — **always skip-smudge + separate lfs pull**: smudge-during-checkout of the ~61 MB
    model OOM'd git on the 3X (`fatal: Out of memory, realloc failed`, 2026-07-08) and left a half-reset
@@ -497,8 +556,7 @@ never-persist-MOCK fix in `card.py` keeps a flaky read from overwriting the good
   `CLEAR_ON_MANAGER_START`. Reading a PERSISTENT key from the mem store returns False forever.
 - **soundd is safety-critical**: only guarded, isolated additions; deploy sound changes WITH the user
   (can't audio-verify remotely).
-- **mapd boot-wedge** = usually INCOMPLETE OSM data; letting the current-state auto-download finish
-  (or triggering "Refresh this location map" to force a clean re-download) fixes it.
+- **mapd boot-wedge** = usually INCOMPLETE OSM data; completing the WA/OR/ID download fixes it.
 - Map DATA (`/data/media/0/osm`) + caches (`/data/pnw/location/`, incl. the police-proxy KEY file that
   must never enter the repo) live OUTSIDE the tree and survive resets; a FACTORY reset wipes them.
 
