@@ -98,6 +98,40 @@ function launch {
       || zstd -dc "$DIR/agnos19-compat/overlay.tar.zst" | tar -xf - -C /data/pnw/agnos19-compat
   fi
 
+  # overlayassert2pnw (CLAUDE.md Rule 2 -- nothing fails silently): VERIFY the overlay is actually
+  # there before we depend on it. Every step above can fail without saying so: the `2>/dev/null`
+  # hides tar's error, the `||` fallback's own exit status is never checked, and if the LFS tarball
+  # was never fetched (a bare pointer file) the `if` simply skips and leaves nothing staged. In all
+  # of those cases PYTHONPATH below points at a directory that does not exist and EVERY openpilot
+  # process dies on `import xattr` / `import capnp` -- which surfaces to the driver as a generic
+  # "process not running" with no hint of the real cause. Cost of getting this wrong once already:
+  # a whole morning attributing healthy uploads to a phantom backend failure.
+  #
+  # Deliberately does NOT abort the boot. If the overlay is gone the device is already broken, and
+  # exiting here would remove the operator's remaining recovery paths (SSH, the UI, updated) instead
+  # of adding any. So: complain unmissably, leave a marker a later process or a human can find, and
+  # let the boot continue. Cheap file probes only -- no python spawn on the boot path.
+  OVERLAY_SP=/data/pnw/agnos19-compat/site-packages
+  OVERLAY_MISSING=""
+  for _pkg in xattr capnproto casadi pyray serial; do
+    [ -e "$OVERLAY_SP/$_pkg" ] || OVERLAY_MISSING="$OVERLAY_MISSING $_pkg"
+  done
+  if [ -n "$OVERLAY_MISSING" ]; then
+    mkdir -p /data/pnw/agnos19-compat
+    echo "missing:$OVERLAY_MISSING staged_from=$DIR/agnos19-compat/overlay.tar.zst at=$(date -u +%FT%TZ)" \
+      > /data/pnw/agnos19-compat/OVERLAY_BROKEN
+    for _i in 1 2 3; do
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+      echo "!! agnos19-compat OVERLAY IS BROKEN OR MISSING:$OVERLAY_MISSING"
+      echo "!! openpilot processes WILL fail to import and manager will report them dead."
+      echo "!! Expected at $OVERLAY_SP -- see AGNOS19-COMPAT.md / docs/DEVICE-TOOLBOX.md."
+      echo "!! Marker written to /data/pnw/agnos19-compat/OVERLAY_BROKEN"
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    done
+  else
+    rm -f /data/pnw/agnos19-compat/OVERLAY_BROKEN   # recovered -> clear the stale marker
+  fi
+
   # hardware specific init
   if [ -f /AGNOS ]; then
     agnos_init
