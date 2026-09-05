@@ -336,11 +336,15 @@ HWY_VEGO        = 55 * CV.MPH_TO_MS       # or sustained speed >= this (authorit
 # takeover. At <= 13.4 m/s (30 mph) the lateral demand only exceeds 3.0 m/s^2 for R < 60 m, i.e. a
 # parking-lot turn, so "the posted limit is physically holdable" is guaranteed rather than assumed.
 # That is the whole reason this bound exists — do not raise it without redoing that arithmetic.
-ICBM_FLOOR_MAX_LIMIT = 13.4    # m/s (~30 mph); above this the floor does not apply AT ALL
+ICBM_FLOOR_MAX_LIMIT = 13.5    # m/s; INCLUSIVE of a real 30 mph = 30 * 0.44704 = 13.4112 m/s.
+                               # Fable 2026-09-05: the original 13.4 EXCLUDED 30 mph by 1.1 cm/s, so
+                               # the constant, the commit message and the test all described a scope
+                               # that could never occur. 13.5 makes the stated scope the real one;
+                               # the holdability argument is unchanged at that margin.
 # The logs show spd_lim flickering (11.2 <-> 8.9 at 06:52:40 and 19:05:16). A 2.3 m/s step passes
 # under the ratchet's 3.0 m/s outlier band, so an un-debounced floor would chase it and produce
 # SET-button tap flicker. Require a real move before the floor follows.
-ICBM_FLOOR_HYST_MS = 2.5       # m/s the posted limit must move before the floor tracks it
+ICBM_FLOOR_HYST_MS = 2.5       # m/s the posted limit must RISE before the floor follows it up
 
 
 def icbm_floor_limit(spd_lim: float, prev: float) -> float:
@@ -355,6 +359,20 @@ def icbm_floor_limit(spd_lim: float, prev: float) -> float:
     return 0.0
   if not (spd_lim == spd_lim) or spd_lim <= 0.0 or spd_lim > ICBM_FLOOR_MAX_LIMIT:
     return 0.0                                  # unknown, or too fast to guarantee holdability
-  if prev > 0.0 and abs(spd_lim - prev) < ICBM_FLOOR_HYST_MS:
-    return prev                                 # inside the deadband -> keep the old floor
+  # ASYMMETRIC, and this is the whole correctness of the function (Fable 2026-09-05 found the
+  # original symmetric |delta| < HYST deadband badly wrong): a LOWER posted limit is followed
+  # IMMEDIATELY, because a lower floor is always the safe direction -- it permits more slowing, never
+  # less. Only a RISING limit is debounced, because that is the direction that could hold the car
+  # faster than the road allows.
+  #
+  # The symmetric version pinned the floor to whichever limit was seen FIRST: 25 mph (11.176) and
+  # 20 mph (8.94) differ by 2.24 m/s, inside the 2.5 deadband, so a 25 -> 20 transition kept flooring
+  # at 24 mph on a 20 mph street INDEFINITELY (only spd_lim == 0 or > MAX reset it). Replaying the
+  # 2026-08-11 log gave 8.49 m/s where the change was written to give 10.73, and 38% of the in-scope
+  # ticks got the wrong floor. Following down immediately also still resolves the observed
+  # 11.2 <-> 8.9 flicker -- to the LOWER value, which is the conservative resolution.
+  if prev > 0.0 and spd_lim < prev:
+    return spd_lim                              # limit dropped -> follow at once (safe direction)
+  if prev > 0.0 and (spd_lim - prev) < ICBM_FLOOR_HYST_MS:
+    return prev                                 # small RISE -> hold, so tap flicker cannot chase it
   return spd_lim

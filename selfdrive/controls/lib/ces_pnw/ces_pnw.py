@@ -1791,6 +1791,7 @@ class CESController:
     # clipped. CUMULATIVE, not per-tick — diff two consecutive records to see how often the cap bit
     # in that second. A per-tick boolean would be invisible at this 1 Hz sampling of a 5 Hz publish.
     self._lc_lim_n = None
+    self._lc_spd_a = None      # lcramp2pnw: speed-authority multiplier actually applied
     # steerlimit-log2pnw telemetry: steering-limit status (from SteerLimitStatus, published by
     # controlsd — see docs/STEERING-LIMITS.md) — logging only, never gates control here. Defaulted
     # so a missing/never-published param (before the first controlsd tick lands) reads as a clean
@@ -2089,11 +2090,18 @@ class CESController:
       self._lc_w = round(float(w), 2) if w is not None else None
       lim_n = lc.get("limN")
       self._lc_lim_n = int(lim_n) if lim_n is not None else None
+      # lcramp2pnw (Fable A1 2026-09-05): spdA was published to LaneCenterStatus but never
+      # cherry-picked here, so the ramp was INVISIBLE in ces_events -- the same trap as
+      # [[vtscstatus-telemetry-not-logged]]. Without it a drive cannot show whether the ramp
+      # engaged at the moment of a complaint, which is the whole reason it was added.
+      spd_a = lc.get("spdA")
+      self._lc_spd_a = round(float(spd_a), 3) if spd_a is not None else None
     except Exception:
       self._lc_corr = self._lc_err = None
       self._lc_p1 = self._lc_p2 = self._lc_s1 = self._lc_s2 = None
       self._lc_ystd = self._lc_w = None
       self._lc_lim_n = None
+      self._lc_spd_a = None
       self._lc_act = False
       self._lc_gate = None
     # steerlimit-log2pnw telemetry: steering-limit status — logging only (see _event_record). Same
@@ -2414,6 +2422,7 @@ class CESController:
         # lanecenter2pnw fields (from LaneCenterStatus) — same subset the enabled-path tick logs.
         "lcCorr": self._lc_corr, "lcAct": self._lc_act, "lcGate": self._lc_gate, "lcErr": self._lc_err,
         "lcLimN": self._lc_lim_n,
+        "lcSpdA": self._lc_spd_a,
         # steerlimit-log2pnw / steertele2pnw / fordkappalog2pnw fields (from SteerLimitStatus).
         "slCurvLim": self._sl_curv_lim, "slSafetyLim": self._sl_safe_lim,
         "slAngDes": self._sl_ang_des, "slAngAct": self._sl_ang_act, "slAngErr": self._sl_ang_err,
@@ -2658,6 +2667,11 @@ class CESController:
         self._icbm_dir = None
         self._icbm_gate = None          # icbmmapfirst2pnw
         self._icbm_map_reach = None
+        # curvefloor2pnw (Fable 2026-09-05, F5): reset the floor state too. Without this a stale
+        # icbmFlrHit=True is published alongside icbmT=None, and _icbm_floor_lim survives a Chill
+        # interlude -- so the debounce carries a limit from before the gap into the road after it.
+        self._icbm_floor_lim = 0.0
+        self._icbm_floor_hit = False
         self._icbm_ep.reset()           # icbmrestore2pnw: forced Chill / no data ends any episode
         self.mem_params.put_nonblocking("IcbmTarget", {})
         return
@@ -2955,7 +2969,7 @@ class CESController:
       "lcP1": self._lc_p1, "lcP2": self._lc_p2, "lcS1": self._lc_s1, "lcS2": self._lc_s2,
       "lcYStd": self._lc_ystd, "lcW": self._lc_w,
       # lcroc2pnw: cumulative ticks the correction_roc growth cap clipped (diff consecutive records).
-      "lcLimN": self._lc_lim_n,
+      "lcLimN": self._lc_lim_n, "lcSpdA": self._lc_spd_a,
       # steerlimit-log2pnw telemetry: steering-limit status (from SteerLimitStatus) — display/log
       # only, same as lc* above. PURE OBSERVATION: never gates or alters any control value. See
       # docs/STEERING-LIMITS.md for what each field means and how to read them together.

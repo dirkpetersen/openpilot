@@ -41,17 +41,36 @@ class TestFloorLimitSelector:
     assert icbm_floor_limit(20.1, 0.0) == 0.0                   # 45 mph
     assert icbm_floor_limit(ICBM_FLOOR_MAX_LIMIT, 0.0) == pytest.approx(ICBM_FLOOR_MAX_LIMIT)
 
+  def test_a_real_30mph_road_IS_in_scope(self):
+    """Fable F2: 30 mph is 30 * 0.44704 = 13.4112 m/s. The original 13.4 ceiling excluded it by
+    1.1 cm/s, so every statement of the scope -- constant, commit, and this file -- was false."""
+    assert icbm_floor_limit(30.0 * 0.44704, 0.0) == pytest.approx(13.4112, abs=1e-4)
+
   def test_unknown_limit_means_no_floor(self):
     assert icbm_floor_limit(0.0, 0.0) == 0.0
     assert icbm_floor_limit(-1.0, 0.0) == 0.0
 
-  def test_flicker_inside_the_deadband_is_held(self):
-    """Logs show spd_lim flapping 11.2 <-> 8.9 (a 2.3 m/s step, UNDER the ratchet's 3.0 outlier
-    band). Chasing it would produce SET-button tap flicker."""
-    assert icbm_floor_limit(8.9, 11.2) == pytest.approx(11.2)
+  def test_a_LOWER_limit_is_followed_immediately(self):
+    """THE fix for Fable F1 (2026-09-05). A lower floor is always the safe direction, so it must not
+    wait for a deadband. The original symmetric |delta| < HYST version pinned the floor to whichever
+    limit was seen first: 25 mph (11.176) -> 20 mph (8.94) is 2.24 m/s, inside the 2.5 band, so it
+    kept flooring at 24 mph on a 20 mph street indefinitely."""
+    assert icbm_floor_limit(8.94, 11.176) == pytest.approx(8.94)
+    assert icbm_floor_limit(5.0, 13.0) == pytest.approx(5.0)
 
-  def test_a_real_change_is_followed(self):
-    assert icbm_floor_limit(11.2 - ICBM_FLOOR_HYST_MS - 0.1, 11.2) == pytest.approx(8.6, abs=0.11)
+  def test_a_small_RISE_is_debounced(self):
+    """Only the unsafe direction is held. 11.2 <-> 8.9 flicker therefore resolves DOWNWARD."""
+    assert icbm_floor_limit(11.176, 8.94) == pytest.approx(8.94)   # +2.24 < 2.5 -> hold low
+
+  def test_a_large_rise_is_followed(self):
+    assert icbm_floor_limit(8.94 + ICBM_FLOOR_HYST_MS + 0.1, 8.94) == pytest.approx(11.54, abs=0.02)
+
+  def test_flicker_cannot_ratchet_the_floor_upward(self):
+    """Alternating 25/20 must settle at the LOW value, never climb."""
+    prev = 0.0
+    for v in (11.176, 8.94) * 6:
+      prev = icbm_floor_limit(v, prev)
+    assert prev == pytest.approx(8.94), "flicker ratcheted the floor up"
 
   def test_garbage_never_raises_and_means_no_floor(self):
     for bad in (None, "x", float("nan"), float("inf")):
@@ -159,3 +178,46 @@ class TestFloorOnTheIcbmPath:
     for _ in range(6):
       run(map_v=7.3, spd_lim=11.2)
     assert hasattr(g, "_icbm_floor_lim") and hasattr(g, "_icbm_floor_hit")
+
+
+class TestFloorTelemetryIsPinned:
+  """Fable F4: deleting all three telemetry lines survived the entire 375-test suite, so the commit's
+  claim that a "telemetry dead" mutation was killed was FALSE. These pin them."""
+
+  def test_the_state_behind_the_telemetry_is_correct(self, tmp_path, monkeypatch):
+    """Behavioural half: the values the telemetry lines read must be right."""
+    run, g = _rig(tmp_path, monkeypatch)
+    for _ in range(8):
+      run(map_v=7.3, spd_lim=11.2)
+    assert g._icbm_floor_lim == pytest.approx(11.2, abs=0.05)
+    assert g._icbm_floor_hit is True
+
+  def test_both_telemetry_lines_still_exist_on_both_record_paths(self):
+    """STRUCTURAL pin, and I am labelling it as such rather than overclaiming.
+
+    Fable F4 showed that deleting all three telemetry lines survived the entire 375-test suite, so
+    the original commit's "telemetry dead mutation killed" claim was FALSE. The values reach
+    ces_events through two dicts built deep inside _icbm_step / the event record, neither reachable
+    from this file's stub rig without a much larger harness. This asserts the emit sites are PRESENT
+    on both paths -- it does NOT prove they carry the right value at runtime (the test above covers
+    the state they read). It exists specifically to fail if someone deletes them, which is the
+    failure that actually happened."""
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[1].joinpath("ces_pnw.py").read_text()
+    assert src.count('"icbmFlr"') >= 2, "icbmFlr emit site removed from a record path"
+    assert src.count('"icbmFlrHit"') >= 2, "icbmFlrHit emit site removed from a record path"
+
+  def test_floor_state_is_cleared_when_icbm_goes_inactive(self, tmp_path, monkeypatch):
+    """Fable F5: a stale icbmFlrHit=True next to icbmT=None misreads as 'the floor fired'."""
+    run, g = _rig(tmp_path, monkeypatch)
+    for _ in range(8):
+      run(map_v=7.3, spd_lim=11.2)
+    assert g._icbm_floor_hit is True
+    g._icbm_last_pub = 0.0
+    import time as _t
+    g._icbm_last_pub = _t.monotonic() - 1.0
+    import inspect
+    from openpilot.selfdrive.controls.lib.ces_pnw import ces_pnw as m
+    cls = next(o for o in vars(m).values() if inspect.isclass(o) and hasattr(o, "_icbm_step"))
+    cls._icbm_step.__get__(g)({"v_ego": 0.0, "v_set": 0.0}, active=False)
+    assert g._icbm_floor_lim == 0.0 and g._icbm_floor_hit is False
