@@ -208,11 +208,31 @@ def pass2_allowed(network_type: int, metered: bool, at_home: bool, onroad: bool,
   # an unrelated CPU hog and coincided with the LOWEST upload rate (1-3/min). Video is still never
   # uploaded while driving — defer_hd is exactly the condition that holds it back (see HD_VIDEO_FILES in
   # list_upload_files), so this cannot re-open the case the gate was written for.
-  if network_type not in PASS2_NETWORK_TYPES or metered:
+  # uploadanywifi2pnw (driver spec 2026-09-05, SUPERSEDES the onroad/parked condition above):
+  # "nothing should be blocked when on a wifi that is (1) either GPS preferred location or (2) on
+  # unmetered wifi -- car running or not should not play a role."
+  #
+  # So the gate is now exactly two independent qualifiers, and `onroad`/`parked` are no longer
+  # consulted at all (the parameters are kept so no call site changes -- see the note below):
+  #   (1) at_home       -- connected to a GPS-gated priority network the driver configured, OR
+  #   (2) not metered   -- any WiFi the OS reports as unmetered.
+  # WiFi itself is still required: both of the driver's qualifiers are phrased "on a wifi", and
+  # PASS2_NETWORK_TYPES is what enforces that. A METERED, non-priority network is still blocked --
+  # that is the one case neither qualifier covers, and it is the on-the-road-hotspot case the
+  # original gate was written to protect.
+  #
+  # ACCEPTED RISK, recorded deliberately: the onroad block came from the 2026-07-13 commIssue
+  # cascade, where pass-2 traffic while driving broke inter-process comms. The 2026-08-21 relaxation
+  # that preceded this one was measured ONLY for the rlog-only queue (~10-13 MB/file, defer_hd set):
+  # 8-10 uploads/min for 23 min with ZERO selfdrivedLagging. Full HD video while driving (75 MB
+  # bursts) has NEVER been measured, and this change permits exactly that whenever DeferHDVideoUpload
+  # is off. If commIssue / selfdrivedLagging returns, THIS is the first change to revert. The cheap
+  # mitigation, if that happens, is to turn DeferHDVideoUpload ON rather than restoring the gate:
+  # that keeps the driving queue rlog-only (the measured-safe shape) while still uploading video at
+  # home. Driver was told this before the change was made and asked for it anyway.
+  if network_type not in PASS2_NETWORK_TYPES:
     return False
-  if not at_home:
-    return False
-  if onroad and not parked and not defer_hd:
+  if metered and not at_home:
     return False
   return True
 

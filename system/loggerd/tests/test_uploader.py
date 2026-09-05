@@ -19,9 +19,17 @@ CELL = int(log.DeviceState.NetworkType.cell4G)
 
 
 class TestUploadGate:
-  """uploadgate2pnw (driver spec 2026-07-13): pass 2 (rlog/HD) ONLY at a priority/home network —
-  never on other WiFi however unmetered (a 75 MB background burst kills an on-the-road hotspot);
-  metered blocks ALL file uploads (pass 1 included); onroad needs Park (GearPark param, no msgq)."""
+  """uploadanywifi2pnw (driver spec 2026-09-05) SUPERSEDES uploadgate2pnw's pass-2 rule.
+
+  New contract, in the driver's words: "nothing should be blocked when on a wifi that is (1) either
+  GPS preferred location or (2) on unmetered wifi -- car running or not should not play a role."
+  So pass 2 needs WiFi AND (at_home OR not metered). `onroad`/`parked` are NO LONGER consulted.
+
+  Pass 1 is unchanged: metered blocks it, unmetered (WiFi or LTE) allows it.
+
+  The three assertions below that reversed (drive-away, unmetered-not-home, metered-at-home) were
+  the OLD spec and are deliberately kept as reversed cases rather than deleted, so the change of
+  contract is visible in the diff instead of silently disappearing."""
 
   # -- pass 1: metered blocks everything; unmetered (wifi or LTE) flows --
   def test_pass1_metered_blocks(self):
@@ -38,18 +46,39 @@ class TestUploadGate:
     # EV charging at home: ignition on -> onroad, gear in Park -> allowed
     assert pass2_allowed(WIFI, metered=False, at_home=True, onroad=True, parked=True)
 
-  def test_pass2_home_onroad_driving_blocks(self):
-    # driving away while still in home WiFi range: no burst mid-drive
-    assert not pass2_allowed(WIFI, metered=False, at_home=True, onroad=True, parked=False)
+  def test_pass2_driving_no_longer_blocks(self):
+    """REVERSED 2026-09-05. Was: driving away in home WiFi range must not burst mid-drive.
+    Now: the car's motion state is explicitly not a factor."""
+    assert pass2_allowed(WIFI, metered=False, at_home=True, onroad=True, parked=False)
 
-  def test_pass2_not_home_never_allows(self):
-    # the driver's core rule: unmetered on-the-road hotspot/WiFi is NOT enough — never pass 2 away
-    # from a priority network, even offroad, even parked
-    assert not pass2_allowed(WIFI, metered=False, at_home=False, onroad=False, parked=False)
-    assert not pass2_allowed(WIFI, metered=False, at_home=False, onroad=True, parked=True)
+  def test_pass2_unmetered_wifi_away_from_home_now_allows(self):
+    """REVERSED 2026-09-05. Was: only a priority network qualified. Now unmetered WiFi qualifies on
+    its own -- the driver's qualifier (2)."""
+    assert pass2_allowed(WIFI, metered=False, at_home=False, onroad=False, parked=False)
+    assert pass2_allowed(WIFI, metered=False, at_home=False, onroad=True, parked=False)
 
-  def test_pass2_metered_blocks_even_at_home(self):
-    assert not pass2_allowed(WIFI, metered=True, at_home=True, onroad=False, parked=True)
+  def test_pass2_metered_priority_network_now_allows(self):
+    """REVERSED 2026-09-05. The driver's qualifier (1) stands alone: a GPS-gated priority network
+    qualifies even if the OS reports it metered."""
+    assert pass2_allowed(WIFI, metered=True, at_home=True, onroad=False, parked=True)
+    assert pass2_allowed(WIFI, metered=True, at_home=True, onroad=True, parked=False)
+
+  def test_pass2_metered_and_not_home_is_the_one_remaining_block(self):
+    """The single case neither qualifier covers -- and the on-the-road-hotspot case the original
+    gate existed to protect. This must stay blocked."""
+    assert not pass2_allowed(WIFI, metered=True, at_home=False, onroad=False, parked=True)
+    assert not pass2_allowed(WIFI, metered=True, at_home=False, onroad=True, parked=False)
+
+  def test_pass2_motion_state_is_never_consulted(self):
+    """Whatever the answer is, it must not depend on onroad/parked -- that is the whole request."""
+    for metered in (True, False):
+      for at_home in (True, False):
+        base = pass2_allowed(WIFI, metered=metered, at_home=at_home, onroad=False, parked=False)
+        for onroad in (True, False):
+          for parked in (True, False):
+            assert pass2_allowed(WIFI, metered=metered, at_home=at_home,
+                                 onroad=onroad, parked=parked) is base, \
+              f"motion state changed the answer at metered={metered} at_home={at_home}"
 
   def test_pass2_non_wifi_blocks_even_at_home(self):
     assert not pass2_allowed(CELL, metered=False, at_home=True, onroad=False, parked=True)
