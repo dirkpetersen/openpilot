@@ -171,6 +171,8 @@ def test_icbm_step_publishes_inc_marker_and_restore_src(tmp_path, monkeypatch):
   mgr._cur_lon = None
   mgr._icbm_ep = m.IcbmEpisode(clear_delay_s=0.0)   # no debounce wait in the unit test
   mgr._icbm_dir = None
+  mgr._icbm_floor_lim = 0.0    # curvefloor2pnw
+  mgr._icbm_floor_hit = False  # curvefloor2pnw
   step = cls._icbm_step.__get__(mgr)
 
   def run(sig, stock_set, stock_on):

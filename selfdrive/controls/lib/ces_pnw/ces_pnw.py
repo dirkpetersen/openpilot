@@ -1867,6 +1867,12 @@ class CESController:
     # icbmrestore2pnw: the cap->clear->restore episode machine + the current direction for telemetry
     self._icbm_ep = IcbmEpisode()
     self._icbm_dir = None                  # "dec" while capping, "inc" while restoring, None idle
+    # curvefloor2pnw: debounced posted limit currently backing the ICBM floor (0.0 = no floor), and
+    # whether the floor actually RAISED the target this tick. Both telemetry-visible (icbmFlr/
+    # icbmFlrHit) so a drive can show the floor working instead of leaving it to inference --
+    # the same trap waysel2pnw fell into when its fields never reached ces_events.
+    self._icbm_floor_lim = 0.0
+    self._icbm_floor_hit = False
     self._stock_set = 0.0
     self._stock_on = False
     # pullaway2pnw: stateful evidence for the below-floor lead-pull-away exception (monotonic
@@ -2718,6 +2724,31 @@ class CESController:
                                                                is_left=is_left), 0.0)
         # rain2pnw: driver-selected wet-weather curve margin (same reduction the Tesla/VTSC gets).
         target = max(target - self._veh.rain_penalty_ms(), 0.0)
+      # curvefloor2pnw: POSTED-LIMIT FLOOR for the ICBM path, low limits only.
+      # 2026-08-11 06:52: spdLim 11.2 (25 mph), map target 7.3 m/s sustained 12 s, stock set tapped
+      # 23.7 -> 7.15 (16 mph). icbmratchet2pnw only confirms single-tick OUTLIER drops, so nothing
+      # caught it. Placed HERE -- after the penalties, before _icbm_ep.step -- so the floored value
+      # is what the ratchet confirms and publishes; a RAISE can never trip the outlier-drop gate.
+      # Floored at limit MINUS the same penalties VTSC subtracts (vtsc_controller floor_v), not at
+      # the bare limit: flooring at the raw posted value would undo the Lightning curve margin and
+      # the rain margin that were just applied, which icbmalign2pnw and rain2pnw exist to preserve.
+      # min(..., ref) so the floor can only ever RAISE a too-low target toward the limit, never
+      # command anything above the reference the driver/episode already allows.
+      self._icbm_floor_lim = C.icbm_floor_limit(sig.get("spd_lim", 0.0), self._icbm_floor_lim)
+      if target is not None and self._icbm_floor_lim > 0.0:
+        try:
+          floor = self._icbm_floor_lim - self._veh.curve_speed_penalty_ms(self._icbm_floor_lim) \
+                                       - self._veh.rain_penalty_ms()
+        except Exception:
+          floor = 0.0            # any penalty failure -> no floor (pre-curvefloor2pnw behaviour)
+        if floor > 0.0:
+          floored = min(max(target, floor), ref)
+          self._icbm_floor_hit = floored > target + 1e-9
+          target = floored
+        else:
+          self._icbm_floor_hit = False
+      else:
+        self._icbm_floor_hit = False
       # icbmrestore2pnw: run the episode machine — it forwards caps unchanged ('dec'), enters the
       # bounded GUARDED restore when the curve clears, and hard-aborts on any driver-intent signal.
       driver_pedal = bool(sig.get("gas")) or bool(sig.get("brake"))
@@ -2793,6 +2824,12 @@ class CESController:
     if self._shadow:
       tele["icbmT"] = self._icbm_last_target
       tele["icbmSrc"] = self._icbm_src           # curveslow-lightning: "map"/"vis"/"restore" source
+      # curvefloor2pnw: the posted-limit floor. icbmFlr = the debounced limit backing it (0 = no
+      # floor active), icbmFlrHit = the floor actually raised the target on this tick. Without both
+      # on the drive log there is no way to tell "the floor never applied" from "the floor applied
+      # and was not needed" -- the exact ambiguity that made the 2026-08-11 over-slow hard to close.
+      tele["icbmFlr"] = round(float(self._icbm_floor_lim), 1)
+      tele["icbmFlrHit"] = bool(self._icbm_floor_hit)
       tele["icbmDir"] = self._icbm_dir           # icbmrestore2pnw: "dec" capping / "inc" restoring
       tele["icbmSet"] = self._stock_set
       tele["icbmOn"] = self._stock_on
@@ -2936,6 +2973,7 @@ class CESController:
       # ceiling, the truck's reported stock set speed + engagement. icbmT stepping the stockSet down
       # in consecutive ticks = executor taps landing.
       "icbmT": self._icbm_last_target, "icbmC": self._icbm_ceiling, "icbmSrc": self._icbm_src,
+      "icbmFlr": round(float(self._icbm_floor_lim), 1), "icbmFlrHit": bool(self._icbm_floor_hit),
       "icbmDir": self._icbm_dir,   # icbmrestore2pnw: "inc" rows in ces_events = restore taps
       "stockSet": self._stock_set, "stockOn": self._stock_on,
       # icbmmapfirst2pnw: start-gate + map coverage forensics (why vision did NOT initiate; whether

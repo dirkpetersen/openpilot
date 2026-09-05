@@ -319,3 +319,42 @@ BTN_EXP   = 2  # forced full Experimental
 TICK_S          = 1.0                    # s between heartbeat breadcrumb records (dense for the test drive)
 HWY_SPEED_LIMIT = 55 * CV.MPH_TO_MS      # OSM speed limit >= this => coarse "highway" guess
 HWY_VEGO        = 55 * CV.MPH_TO_MS       # or sustained speed >= this (authoritative = GPS+OSM+300ft in analysis)
+
+# ---------------------------------------------------------------------------------------------
+# curvefloor2pnw (2026-09-05) — a POSTED-LIMIT FLOOR for the Lightning's ICBM (stock-ACC) path.
+#
+# Evidence (drives/2026-08-11, 06:52:45-57 PT): spdLim 11.2 m/s (25 mph), mapd's target 7.3 m/s
+# SUSTAINED for 12 s, icbmSrc 'map', and the stock set speed tapped 23.7 -> 7.15 m/s (16 mph) on a
+# 25 mph road. icbmratchet2pnw does NOT catch this: it confirms single-tick OUTLIER drops
+# (ICBM_RATCHET_OUTLIER_DROP_MS = 3.0 over CONFIRM_S = 0.6), and this was a sustained map target.
+# VTSC has floored its cap at the posted limit since 2026-07-01; the ICBM path never had one.
+#
+# SCOPE IS DELIBERATELY NARROW — low limits only. Fable review 2026-09-05 rejected the original
+# branch's all-roads floor: on a 45 mph surface road with an R=80 m bend, flooring the cap at the
+# limit demands 20.1^2/80 = 5.05 m/s^2 lateral — 2x A_LAT_TARGET, above the 3.0 fail-safe clip and
+# at/above the Lightning's measured ~4.5 m/s^2 hands-off ceiling. It would understeer into a
+# takeover. At <= 13.4 m/s (30 mph) the lateral demand only exceeds 3.0 m/s^2 for R < 60 m, i.e. a
+# parking-lot turn, so "the posted limit is physically holdable" is guaranteed rather than assumed.
+# That is the whole reason this bound exists — do not raise it without redoing that arithmetic.
+ICBM_FLOOR_MAX_LIMIT = 13.4    # m/s (~30 mph); above this the floor does not apply AT ALL
+# The logs show spd_lim flickering (11.2 <-> 8.9 at 06:52:40 and 19:05:16). A 2.3 m/s step passes
+# under the ratchet's 3.0 m/s outlier band, so an un-debounced floor would chase it and produce
+# SET-button tap flicker. Require a real move before the floor follows.
+ICBM_FLOOR_HYST_MS = 2.5       # m/s the posted limit must move before the floor tracks it
+
+
+def icbm_floor_limit(spd_lim: float, prev: float) -> float:
+  """Debounced posted limit for the ICBM floor. Returns 0.0 when no floor applies.
+
+  Pure + total: any non-finite or nonsensical input yields 0.0 (no floor), which is the
+  pre-curvefloor2pnw behaviour and therefore the fail-safe direction.
+  """
+  try:
+    spd_lim = float(spd_lim); prev = float(prev)
+  except (TypeError, ValueError):
+    return 0.0
+  if not (spd_lim == spd_lim) or spd_lim <= 0.0 or spd_lim > ICBM_FLOOR_MAX_LIMIT:
+    return 0.0                                  # unknown, or too fast to guarantee holdability
+  if prev > 0.0 and abs(spd_lim - prev) < ICBM_FLOOR_HYST_MS:
+    return prev                                 # inside the deadband -> keep the old floor
+  return spd_lim

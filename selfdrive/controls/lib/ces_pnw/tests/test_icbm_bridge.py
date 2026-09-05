@@ -141,6 +141,8 @@ def test_icbm_step_gating_chill_vs_ces():
   from openpilot.selfdrive.controls.lib.ces_pnw.ces_pnw import IcbmEpisode
   mgr._icbm_ep = IcbmEpisode()
   mgr._icbm_dir = None
+  mgr._icbm_floor_lim = 0.0    # curvefloor2pnw
+  mgr._icbm_floor_hit = False  # curvefloor2pnw
   mgr._stock_set = 0.0
   mgr._stock_on = False
   step = cls._icbm_step.__get__(mgr)
@@ -354,6 +356,8 @@ def _icbm_stub(veh):
   # icbmrestore2pnw: episode machine + stock-ACC readings
   mgr._icbm_ep = m.IcbmEpisode()
   mgr._icbm_dir = None
+  mgr._icbm_floor_lim = 0.0    # curvefloor2pnw
+  mgr._icbm_floor_hit = False  # curvefloor2pnw
   mgr._stock_set = 0.0
   mgr._stock_on = False
   return mgr, cls._icbm_step.__get__(mgr)
