@@ -22,59 +22,91 @@ import pytest
 from openpilot.selfdrive.controls.lib import pnw_vehicle as pv
 from openpilot.selfdrive.controls.lib.pnw_vehicle import PnwVehicle
 from openpilot.selfdrive.controls.lib.ces_pnw import ces_pnw as m
-from openpilot.selfdrive.controls.lib.ces_pnw.ces_pnw_constants import (ICBM_FLOOR_HYST_MS,
-                                                                        ICBM_FLOOR_MAX_LIMIT,
+from openpilot.selfdrive.controls.lib.ces_pnw.ces_pnw_constants import (ICBM_FLOOR_MAX_LIMIT,
+                                                                        ICBM_FLOOR_RISE_HOLD_S,
                                                                         icbm_floor_limit)
 
 LIGHTNING = "FORD_F_150_LIGHTNING_MK1"
 
 
 # --- the debounced limit selector -------------------------------------------------------------
+def _lim(spd, prev=0.0, now=0.0, pending=None):
+  """Convenience: return just the floor."""
+  return icbm_floor_limit(spd, prev, now, pending)[0]
+
+
 class TestFloorLimitSelector:
   def test_a_low_posted_limit_qualifies(self):
-    assert icbm_floor_limit(11.2, 0.0) == pytest.approx(11.2)   # 25 mph, the 08-11 road
+    assert _lim(11.2) == pytest.approx(11.2)                    # 25 mph, the 08-11 road
 
   def test_a_high_posted_limit_never_qualifies(self):
-    """THE scope bound. Above this the posted limit is not guaranteed holdable through a bend, and
-    flooring there is what the review rejected."""
-    assert icbm_floor_limit(ICBM_FLOOR_MAX_LIMIT + 0.1, 0.0) == 0.0
-    assert icbm_floor_limit(20.1, 0.0) == 0.0                   # 45 mph
-    assert icbm_floor_limit(ICBM_FLOOR_MAX_LIMIT, 0.0) == pytest.approx(ICBM_FLOOR_MAX_LIMIT)
+    assert _lim(ICBM_FLOOR_MAX_LIMIT + 0.1) == 0.0
+    assert _lim(20.1) == 0.0                                     # 45 mph
+    assert _lim(ICBM_FLOOR_MAX_LIMIT) == pytest.approx(ICBM_FLOOR_MAX_LIMIT)
 
   def test_a_real_30mph_road_IS_in_scope(self):
-    """Fable F2: 30 mph is 30 * 0.44704 = 13.4112 m/s. The original 13.4 ceiling excluded it by
-    1.1 cm/s, so every statement of the scope -- constant, commit, and this file -- was false."""
-    assert icbm_floor_limit(30.0 * 0.44704, 0.0) == pytest.approx(13.4112, abs=1e-4)
+    """Fable F2: 30 mph is 13.4112 m/s; the original 13.4 ceiling excluded it by 1.1 cm/s."""
+    assert _lim(30.0 * 0.44704) == pytest.approx(13.4112, abs=1e-4)
+
+  def test_the_ceiling_matches_its_documented_arithmetic(self):
+    """Fable M5/M6 both SURVIVED: nothing stopped the ceiling drifting upward, even though its own
+    comment says "do not raise it without redoing the arithmetic". The bound exists because at
+    <= 13.5 m/s the lateral demand v^2/R exceeds the 3.0 m/s^2 fail-safe clip only for R < ~60 m --
+    a parking-lot turn -- so "the posted limit is physically holdable" is GUARANTEED rather than
+    assumed. Raising it silently breaks that guarantee, which is the whole basis of the feature's
+    scope. If you change it, change this test and redo the numbers below deliberately."""
+    assert ICBM_FLOOR_MAX_LIMIT == pytest.approx(13.5), "ceiling moved without redoing the arithmetic"
+    r_crit = ICBM_FLOOR_MAX_LIMIT ** 2 / 3.0          # radius at which demand hits the 3.0 clip
+    assert r_crit < 61.0, f"at {ICBM_FLOOR_MAX_LIMIT} m/s the 3.0 m/s^2 clip binds out to R={r_crit:.1f} m"
+    assert ICBM_FLOOR_MAX_LIMIT >= 30.0 * 0.44704, "30 mph must remain inside the scope"
+
+  def test_35mph_stays_OUT_of_scope(self):
+    """Fable M5/M6 SURVIVED: nothing stopped the ceiling being raised, though its own comment says
+    'do not raise without redoing the arithmetic'. 35 mph = 15.65 m/s must never qualify -- the
+    holdability argument (lateral demand exceeds 3.0 m/s^2 only for R < ~60 m) does not hold there."""
+    assert _lim(35.0 * 0.44704) == 0.0
+    assert ICBM_FLOOR_MAX_LIMIT < 35.0 * 0.44704
 
   def test_unknown_limit_means_no_floor(self):
-    assert icbm_floor_limit(0.0, 0.0) == 0.0
-    assert icbm_floor_limit(-1.0, 0.0) == 0.0
+    assert _lim(0.0) == 0.0
+    assert _lim(-1.0) == 0.0
 
   def test_a_LOWER_limit_is_followed_immediately(self):
-    """THE fix for Fable F1 (2026-09-05). A lower floor is always the safe direction, so it must not
-    wait for a deadband. The original symmetric |delta| < HYST version pinned the floor to whichever
-    limit was seen first: 25 mph (11.176) -> 20 mph (8.94) is 2.24 m/s, inside the 2.5 band, so it
-    kept flooring at 24 mph on a 20 mph street indefinitely."""
-    assert icbm_floor_limit(8.94, 11.176) == pytest.approx(8.94)
-    assert icbm_floor_limit(5.0, 13.0) == pytest.approx(5.0)
+    """A lower floor permits more slowing -- always safe, must not wait."""
+    assert _lim(8.94, prev=11.176) == pytest.approx(8.94)
+    assert _lim(5.0, prev=13.0) == pytest.approx(5.0)
 
-  def test_a_small_RISE_is_debounced(self):
-    """Only the unsafe direction is held. 11.2 <-> 8.9 flicker therefore resolves DOWNWARD."""
-    assert icbm_floor_limit(11.176, 8.94) == pytest.approx(8.94)   # +2.24 < 2.5 -> hold low
+  def test_a_rise_is_held_until_it_PERSISTS(self):
+    """THE fix for Fable's second F1 finding. A real 5 mph step (2.235 m/s) is the SAME SIZE as the
+    observed flicker, so the old 2.5 m/s value band held every genuine step-up forever -- turning
+    the intended 25 mph floor into a 20 mph one on the 08-11 route. Only persistence separates them."""
+    floor, pend = icbm_floor_limit(11.176, 8.94, now=0.0, pending=None)
+    assert floor == pytest.approx(8.94), "adopted a rise instantly"
+    floor, pend = icbm_floor_limit(11.176, floor, now=ICBM_FLOOR_RISE_HOLD_S - 0.5, pending=pend)
+    assert floor == pytest.approx(8.94), "adopted before the window elapsed"
+    floor, pend = icbm_floor_limit(11.176, floor, now=ICBM_FLOOR_RISE_HOLD_S + 0.1, pending=pend)
+    assert floor == pytest.approx(11.176), "a rise that PERSISTED was never adopted"
 
-  def test_a_large_rise_is_followed(self):
-    assert icbm_floor_limit(8.94 + ICBM_FLOOR_HYST_MS + 0.1, 8.94) == pytest.approx(11.54, abs=0.02)
+  def test_flicker_never_ratchets_the_floor_up(self):
+    """Alternating 25/20 faster than the hold window must settle LOW and stay there."""
+    floor, pend = 0.0, None
+    for i, v in enumerate((11.176, 8.94) * 8):
+      floor, pend = icbm_floor_limit(v, floor, now=i * 0.25, pending=pend)
+    assert floor == pytest.approx(8.94), "flicker ratcheted the floor up"
 
-  def test_flicker_cannot_ratchet_the_floor_upward(self):
-    """Alternating 25/20 must settle at the LOW value, never climb."""
-    prev = 0.0
-    for v in (11.176, 8.94) * 6:
-      prev = icbm_floor_limit(v, prev)
-    assert prev == pytest.approx(8.94), "flicker ratcheted the floor up"
+  def test_the_floor_is_never_above_the_posted_limit(self):
+    """Fable fuzzed 200k sequences for this. The floor may lag a rise but must never exceed the road."""
+    import random
+    rng = random.Random(1234)
+    floor, pend = 0.0, None
+    for i in range(4000):
+      v = rng.choice((8.94, 11.176, 13.4112, 8.94))
+      floor, pend = icbm_floor_limit(v, floor, now=i * 0.25, pending=pend)
+      assert floor <= v + 1e-9, f"floor {floor} exceeded posted limit {v}"
 
   def test_garbage_never_raises_and_means_no_floor(self):
     for bad in (None, "x", float("nan"), float("inf")):
-      assert icbm_floor_limit(bad, 0.0) == 0.0
+      assert _lim(bad) == 0.0
 
 
 # --- end-to-end through the real _icbm_step ---------------------------------------------------
@@ -105,6 +137,7 @@ def _rig(tmp_path, monkeypatch):
   g._icbm_ep = m.IcbmEpisode()
   g._icbm_dir = None
   g._icbm_floor_lim = 0.0
+  g._icbm_floor_pend = None
   g._icbm_floor_hit = False
   g._icbm_gate = None
   g._icbm_map_reach = None

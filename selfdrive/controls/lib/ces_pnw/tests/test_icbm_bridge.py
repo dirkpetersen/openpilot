@@ -142,6 +142,7 @@ def test_icbm_step_gating_chill_vs_ces():
   mgr._icbm_ep = IcbmEpisode()
   mgr._icbm_dir = None
   mgr._icbm_floor_lim = 0.0    # curvefloor2pnw
+  mgr._icbm_floor_pend = None  # curvefloor2pnw
   mgr._icbm_floor_hit = False  # curvefloor2pnw
   mgr._stock_set = 0.0
   mgr._stock_on = False
@@ -357,6 +358,7 @@ def _icbm_stub(veh):
   mgr._icbm_ep = m.IcbmEpisode()
   mgr._icbm_dir = None
   mgr._icbm_floor_lim = 0.0    # curvefloor2pnw
+  mgr._icbm_floor_pend = None  # curvefloor2pnw
   mgr._icbm_floor_hit = False  # curvefloor2pnw
   mgr._stock_set = 0.0
   mgr._stock_on = False

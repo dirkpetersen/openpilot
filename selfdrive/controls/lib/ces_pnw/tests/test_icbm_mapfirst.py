@@ -120,6 +120,7 @@ def _icbm_stub(veh=None):
   mgr._icbm_ep = m.IcbmEpisode()
   mgr._icbm_dir = None
   mgr._icbm_floor_lim = 0.0    # curvefloor2pnw
+  mgr._icbm_floor_pend = None  # curvefloor2pnw
   mgr._icbm_floor_hit = False  # curvefloor2pnw
   mgr._icbm_gate = None
   mgr._icbm_map_reach = None

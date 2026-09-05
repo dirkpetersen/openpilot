@@ -1874,6 +1874,7 @@ class CESController:
     # icbmFlrHit) so a drive can show the floor working instead of leaving it to inference --
     # the same trap waysel2pnw fell into when its fields never reached ces_events.
     self._icbm_floor_lim = 0.0
+    self._icbm_floor_pend = None   # (candidate_limit, first_seen) while a RISE settles
     self._icbm_floor_hit = False
     self._stock_set = 0.0
     self._stock_on = False
@@ -2671,6 +2672,7 @@ class CESController:
         # icbmFlrHit=True is published alongside icbmT=None, and _icbm_floor_lim survives a Chill
         # interlude -- so the debounce carries a limit from before the gap into the road after it.
         self._icbm_floor_lim = 0.0
+        self._icbm_floor_pend = None
         self._icbm_floor_hit = False
         self._icbm_ep.reset()           # icbmrestore2pnw: forced Chill / no data ends any episode
         self.mem_params.put_nonblocking("IcbmTarget", {})
@@ -2766,7 +2768,8 @@ class CESController:
       # the rain margin that were just applied, which icbmalign2pnw and rain2pnw exist to preserve.
       # min(..., ref) so the floor can only ever RAISE a too-low target toward the limit, never
       # command anything above the reference the driver/episode already allows.
-      self._icbm_floor_lim = C.icbm_floor_limit(sig.get("spd_lim", 0.0), self._icbm_floor_lim)
+      self._icbm_floor_lim, self._icbm_floor_pend = C.icbm_floor_limit(
+        sig.get("spd_lim", 0.0), self._icbm_floor_lim, now, self._icbm_floor_pend)
       if target is not None and self._icbm_floor_lim > 0.0:
         try:
           floor = self._icbm_floor_lim - self._veh.curve_speed_penalty_ms(self._icbm_floor_lim) \

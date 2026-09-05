@@ -344,35 +344,48 @@ ICBM_FLOOR_MAX_LIMIT = 13.5    # m/s; INCLUSIVE of a real 30 mph = 30 * 0.44704 
 # The logs show spd_lim flickering (11.2 <-> 8.9 at 06:52:40 and 19:05:16). A 2.3 m/s step passes
 # under the ratchet's 3.0 m/s outlier band, so an un-debounced floor would chase it and produce
 # SET-button tap flicker. Require a real move before the floor follows.
-ICBM_FLOOR_HYST_MS = 2.5       # m/s the posted limit must RISE before the floor follows it up
+# TIME debounce, not a value band. Fable 2026-09-05 measured why a value band cannot work here: a
+# real 5 mph step is 2.235 m/s, so ANY deadband wide enough to swallow the observed 11.2 <-> 8.9
+# flicker also swallows every genuine 20->25 and 25->30 transition -- permanently. On the 2026-08-11
+# route that turned the intended 25 mph floor into a 20 mph floor (7 of 22 in-scope rises held
+# forever; the event window floored at 8.45 m/s = 19 mph, not the 10.73 = 24 mph the feature was
+# written for). Flicker and a real change are the SAME SIZE; only their PERSISTENCE differs.
+ICBM_FLOOR_RISE_HOLD_S = 3.0   # a higher limit must persist this long before the floor follows it up
 
 
-def icbm_floor_limit(spd_lim: float, prev: float) -> float:
-  """Debounced posted limit for the ICBM floor. Returns 0.0 when no floor applies.
+def icbm_floor_limit(spd_lim: float, prev: float, now: float = 0.0, pending=None):
+  """Debounced posted limit for the ICBM floor. Returns (floor, pending).
 
-  Pure + total: any non-finite or nonsensical input yields 0.0 (no floor), which is the
+  `pending` is (candidate_limit, first_seen_monotonic) or None -- carry it across calls.
+
+  ASYMMETRIC, and that is the whole correctness of this function:
+    * a LOWER limit is followed IMMEDIATELY -- a lower floor permits more slowing, never less, so it
+      is always the safe direction and must not wait;
+    * a HIGHER limit must PERSIST for ICBM_FLOOR_RISE_HOLD_S before the floor follows it up.
+
+  Why persistence rather than magnitude: flicker and a real change are the same size (both are one
+  5 mph step = 2.235 m/s), so no value deadband can tell them apart -- the earlier 2.5 m/s band held
+  every genuine step-up forever and turned the intended 25 mph floor into a 20 mph one. What actually
+  separates them is that flicker does not last.
+
+  Pure and total: any non-finite or nonsensical input yields (0.0, None) -- no floor, which is the
   pre-curvefloor2pnw behaviour and therefore the fail-safe direction.
   """
   try:
-    spd_lim = float(spd_lim); prev = float(prev)
+    spd_lim = float(spd_lim); prev = float(prev); now = float(now)
   except (TypeError, ValueError):
-    return 0.0
+    return 0.0, None
   if not (spd_lim == spd_lim) or spd_lim <= 0.0 or spd_lim > ICBM_FLOOR_MAX_LIMIT:
-    return 0.0                                  # unknown, or too fast to guarantee holdability
-  # ASYMMETRIC, and this is the whole correctness of the function (Fable 2026-09-05 found the
-  # original symmetric |delta| < HYST deadband badly wrong): a LOWER posted limit is followed
-  # IMMEDIATELY, because a lower floor is always the safe direction -- it permits more slowing, never
-  # less. Only a RISING limit is debounced, because that is the direction that could hold the car
-  # faster than the road allows.
-  #
-  # The symmetric version pinned the floor to whichever limit was seen FIRST: 25 mph (11.176) and
-  # 20 mph (8.94) differ by 2.24 m/s, inside the 2.5 deadband, so a 25 -> 20 transition kept flooring
-  # at 24 mph on a 20 mph street INDEFINITELY (only spd_lim == 0 or > MAX reset it). Replaying the
-  # 2026-08-11 log gave 8.49 m/s where the change was written to give 10.73, and 38% of the in-scope
-  # ticks got the wrong floor. Following down immediately also still resolves the observed
-  # 11.2 <-> 8.9 flicker -- to the LOWER value, which is the conservative resolution.
-  if prev > 0.0 and spd_lim < prev:
-    return spd_lim                              # limit dropped -> follow at once (safe direction)
+    return 0.0, None                            # unknown, or too fast to guarantee holdability
+  if prev <= 0.0 or spd_lim <= prev:
+    return spd_lim, None                        # first reading, or a DROP -> take it at once
+  # A rise: hold the old floor until the new, higher limit has stood for the full window.
+  cand, since = pending if pending else (None, None)
+  if cand is None or abs(cand - spd_lim) > 1e-6:
+    return prev, (spd_lim, now)                 # new candidate -> start its clock
+  if (now - since) >= ICBM_FLOOR_RISE_HOLD_S:
+    return spd_lim, None                        # it stuck -> adopt it
+  return prev, (cand, since)                    # still settling -> keep the lower floor                              # limit dropped -> follow at once (safe direction)
   if prev > 0.0 and (spd_lim - prev) < ICBM_FLOOR_HYST_MS:
     return prev                                 # small RISE -> hold, so tap flicker cannot chase it
   return spd_lim
