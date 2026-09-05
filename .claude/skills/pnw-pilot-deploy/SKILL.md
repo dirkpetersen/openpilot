@@ -167,6 +167,48 @@ is the real car (see Verification).
 | **`3testpnw`** | **The FRIENDS' install channel — NEVER experiment on it** (mistake made + reverted 2026-07-09). Promote only truly validated states. |
 | `3pnw` / `pnwprod` | Release; untouched by day-to-day work. |
 
+## 🔴 REVIEW BEFORE PUSH — non-negotiable (driver directive 2026-09-05)
+
+**A review agent MUST have run before code is pushed.** Not before deploy, not before reboot —
+**before `git push`**. Pushing to a channel branch is the ship action; the device auto-updates from it.
+
+**Run BOTH reviewers IN PARALLEL:**
+
+| reviewer | how | model |
+|---|---|---|
+| **Gemini** | the `gemini` skill | **`gemini-flash-latest`** |
+| **Fable** | `Agent` tool with `model: "fable"` | — |
+
+They run **concurrently**, not in sequence — launch both, then continue working. **Fable's review may
+complete asynchronously**: you may start the next coding task while it runs. What you may NOT do is
+push before a review has happened.
+
+**If the two disagree, FABLE HAS THE LAST WORD.** Do not average them, and do not drop a Gemini
+finding because Fable did not raise it — reconcile explicitly and say which one you followed.
+(Precedent: 2026-09-03 on `waysel2pnw`'s `curveWin`, Fable was right and Gemini reached the opposite
+conclusion.)
+
+### Why this rule exists
+- **2026-09-03:** `waysel2pnw` (`c8bfce5b6e`) shipped unreviewed. All 8 telemetry fields read `null`
+  on the car — three separate defects, one of them an `except: pass` of the author's own that hid it.
+- **2026-09-05:** SIX commits shipped unreviewed in one session (`overlayassert2pnw`, `lcramp2pnw`,
+  `uploadanywifi2pnw`, `curvefloor2pnw`, `parkedlog2pnw`, `cargps2pnw`) — including C++ in the
+  logging path and a change to a CAR PORT where a mistake makes `canValid` false and the vehicle
+  undriveable. The driver had to ask "did you use a fable background review?" That is the failure
+  this rule prevents.
+
+### What to give the reviewer
+The diff (`git show <sha>`), the surrounding code, the project rules it must hold the change against,
+and **the specific claim you want tested** — the load-bearing safety argument, stated plainly. A
+review told "check this commit" finds less than one told "the author claims X makes a missing CAN
+message harmless; verify that, including the bus_timeout path."
+
+### Also ask, every time
+- Which test would FAIL if this change were reverted? If none, the change is untested.
+- Which mutations survive? Report survivors rather than hiding them.
+
+---
+
 ## 🔴 WIDE-CAMERA UPLOAD — quiet it for the deploy, re-arm it after (driver directive 2026-09-05)
 
 `SkipWideCameraUpload` gates `ecamera.hevc` (the wide road camera — roughly HALF the video bytes the
