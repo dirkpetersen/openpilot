@@ -1,3 +1,8 @@
+---
+updated: 2026-09-05
+status: current
+---
+
 # Credits
 
 PNW-pilot stands on the work of these projects and people. Nearly every feature in this
@@ -47,6 +52,22 @@ wherever available.
   (including the anti-overshoot logic) on the BluePilot `bp-dev` line.
 - Individual contributions there also from **[@tonesto7](https://github.com/tonesto7)** and
   John Christman.
+
+### Ford angle-primary lateral control (`LateralAngleExt`, bp-7.0) — **PNW's default lateral path**
+- **[@alan-polk](https://github.com/alan-polk)** (BluePilot) — author and publisher of the
+  "Return of Angle Control" design (bluepilot.dev, 2026-07-15) and of `lateral_angle_ext.py` on the
+  BluePilot `bp-7.0` line: commanding the Ford PSCM by **path angle** rather than curvature, with
+  `path_angle = kappa_cmd * v_ego * curvature_factor(...)`, c2 (curvature) and c3 (curvature_rate)
+  ZEROED on the LMC/LMC2 wire, and the speed-scheduled gain table and soft rate-of-change limits
+  that make it behave. PNW-pilot ports this **faithfully** as `angle2pnw-faithful2` ->
+  `opendbc/car/ford/lateral_angle_pnw.py` — no lookahead, no PID, no negation added; his in-code
+  values are the defaults, and an absent tuning file means his numbers exactly. It is the lateral
+  path the F-150 Lightning ships with **ON by default**. Spec and port deviations are documented in
+  `docs/pnw/angle-steering/` (`ALAN-POLK-SPEC.md` is authoritative).
+- Also from BluePilot `bp-dev` (`9012f76666`): the **anti-stall blip guard** —
+  `_BLIP_MAX_PATH_ANGLE = 0.10` rad, so the pre-existing PSCM-unstick "steering release blip" can
+  only fire on straights and never while `path_angle` indicates an active curve. Ported as
+  `blipguard2pnw` (2026-09-05).
 
 ### Ford longitudinal follow control (`longitudinal_ext`)
 - **[@alan-polk](https://github.com/alan-polk)** (BluePilot) — author of `longitudinal_ext.py`
@@ -105,6 +126,19 @@ wherever available.
   hard-clamped safety envelope, live JSON tuning at `/data/pnw/lanecenter_tuning.json`, and a single
   `DisableLaneCentering` opt-out (ships ON). Implementation:
   `selfdrive/controls/lib/lane_centering.py` on the PNW line.
+- **[@alan-polk](https://github.com/alan-polk)** (BluePilot) — BluePilot independently ported the
+  same StarPilot approach into its angle path as "Advanced Lane Positioning"
+  (`lane_center_trim.py`), and iterated it hard through August 2026. PNW-pilot adopted **two ideas
+  from that iteration** rather than the code (2026-09-05):
+  - a **per-tick rate-of-change cap on the correction that is independent of the exponential
+    filter** (`_CORRECTION_ROC_PER_TICK`, BluePilot `af4bc410c9`) — the filter bounds how fast the
+    correction chases its target but not how far the *target* may jump, which is exactly what a
+    curve-exit confidence flip does. Ported as `lcroc2pnw`, with the rate re-derived for PNW's
+    correction domain rather than copied.
+  - a **speed-scheduled authority ramp** (`_SPEED_RAMP_BP`, 0 -> full between 9 and 15 m/s) in place
+    of PNW's hard on/off above `min_v_ego`. Ported as `lcramp2pnw`.
+  Their tuning history was informative in itself: BluePilot raised the trim's authority, got tester
+  pushback, and settled *below* where they started — which is why PNW left `max_gain` alone.
 
 ## Thank you
 
