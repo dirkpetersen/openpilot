@@ -180,6 +180,13 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // next driving segment's video -- see loggerd.cc). Rotation is time-based so nothing stalls.
     // Default OFF (no behaviour change); enable per-device, like its sibling above.
     {"ThinRlogWhenParked", {PERSISTENT, BOOL, "0"}},
+    // cargps2pnw: the CAR's own GPS fix, published ~1 Hz by the ford carstate from the GWM's
+    // APIMGPS messages on the camera bus (0x462/0x464) and logged as `car_gps` in ces_events
+    // ALONGSIDE the device's own fix -- a side-by-side comparison channel, never a substitute.
+    // Measured on-vehicle 2026-09-05: agreed with the device to 5.4 m, 31 sats, HDOP 0.4.
+    // TELEMETRY ONLY; nothing consumes it for control. EMPTY on the Tesla by construction (no
+    // Ford carstate -> no publisher -> the key never appears and car_gps logs as None).
+    {"CarGps", {CLEAR_ON_MANAGER_START, JSON}},
     {"SkipWideCameraUpload", {PERSISTENT, BOOL, "0"}},  // uploadprio2pnw: skip uploading the WIDE road camera (ecamera.hevc) in pass 2 -- half the video bytes of the pass-2 backlog. Skipped-not-marked (never xattr-stamped), so the files upload again as soon as this goes back off -- BUT note the deleter also stops counting ecamera as "un-uploaded" while this is on (uploadable_firehose_files), which is the point (it frees those segments for reclaim), so under disk pressure some skipped ecamera files will have been deleted by then. Destruction of any never-uploaded firehose file is still logged at ERROR. Unlike DeferHDVideoUpload, which is a temporary hold and keeps its full deleter protection. Default OFF (no behaviour change).
     {"LastUploadError", {CLEAR_ON_MANAGER_START, STRING}},  // uploadretry2pnw: last hard upload failure (HTTP status/exc) for the CES overlay, change-only; removed on next success + on startup
     {"DmMode", {PERSISTENT, INT, "0"}},  // dmroad2pnw: 3-way driver-monitoring timeout selector. 0=Off (stock strict everywhere), 1=Highway (900s pose/1800s phone on freeway or divided-2-lane, stock elsewhere), 2=Relaxed (10800s/3600s everywhere). Default OFF. Does NOT touch the glare knobs.

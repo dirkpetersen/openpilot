@@ -151,6 +151,7 @@ class _SteerLogHarness:
     self._car = "TESTCAR"
     self._cur_lat, self._cur_lon, self._cur_bearing = cur_lat, cur_lon, cur_bearing
     self._speed_limit = 0.0
+    self._car_gps = None   # cargps2pnw: Ford-only CarGps dict; None is the Tesla/no-fix case
     self._vtsc_cap = None
     self._vtsc_state = None
     self._lc_corr = self._lc_act = self._lc_gate = self._lc_err = None

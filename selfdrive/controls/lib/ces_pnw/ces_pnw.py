@@ -1764,6 +1764,7 @@ class CESController:
     self._toggles = {"curves": True, "stops": True, "low_speed": True, "lead": True}
     self._map_targets = []          # cached MapTargetVelocities (refreshed ~1 Hz)
     self._cur_lat = self._cur_lon = self._cur_bearing = None
+    self._car_gps = None       # cargps2pnw: last CarGps dict from the ford carstate (None on Tesla)
     # steerpower2pnw I3 review fix: bounded (wall_time, bearing, gps_valid) history, appended once per
     # _read_map() refresh (~1 Hz) -- see _nearest_bearing() above. Lets a steerEvent record look up
     # the bearing at its actual saturation ONSET instead of the live value at emit time.
@@ -1964,6 +1965,19 @@ class CESController:
       self._cur_bearing = float(pos.get("bearing", 0.0))
     except Exception:
       self._cur_lat = self._cur_lon = self._cur_bearing = None
+    # cargps2pnw: the CAR's own GPS fix (Ford only), published by the ford carstate from the GWM's
+    # APIMGPS messages at 1 Hz. Logged ALONGSIDE the device's own fix above, never instead of it --
+    # nothing here or downstream consumes it, this is a side-by-side comparison channel so a drive
+    # can show whether the truck's roof antenna actually beats the device's windshield view when it
+    # matters (cold start, urban canyon). EMPTY ON THE TESLA by construction: no Ford carstate, no
+    # publisher, so the key never appears and `car_gps` logs as None.
+    try:
+      cg = self.mem_params.get("CarGps", return_default=True)
+      if isinstance(cg, (bytes, str)):
+        cg = json.loads(cg)
+      self._car_gps = cg if isinstance(cg, dict) and "lat" in cg else None
+    except Exception:
+      self._car_gps = None
     # OSM speed limit (m/s; 0 = none) — for the coarse highway guess in the log
     try:
       sl = self.mem_params.get("MapSpeedLimit", return_default=True)
@@ -2390,6 +2404,10 @@ class CESController:
         "gps": gps_valid,
         "lat": self._cur_lat, "lon": self._cur_lon, "bearing": self._cur_bearing,
         "spdLim": round(self._speed_limit, 1) if self._speed_limit else 0.0,
+        # cargps2pnw: the CAR's own GPS, logged ALONGSIDE the device fix (lat/lon/bearing
+        # elsewhere in this record), never instead of it. None on the Tesla -- no Ford
+        # carstate means nothing publishes CarGps, which is the intended "empty" case.
+        "car_gps": self._car_gps,
         # VTSC applied cap + state (from VTSCStatus) — same fields as the enabled-path tick record.
         "vtscCap": self._vtsc_cap, "vtscState": self._vtsc_state, **getattr(self, "_vtsc_tele", {}),
         **getattr(self, "_sa_tele", {}),
@@ -2918,6 +2936,7 @@ class CESController:
       "lead": tele.get("lead"), "hasLead": tele.get("lead"), "gapS": tele.get("gapS"), "dV": tele.get("dV"),
       "gps": tele.get("gps"), "lat": self._cur_lat, "lon": self._cur_lon, "bearing": self._cur_bearing,
       "spdLim": round(self._speed_limit, 1), "hwy": bool(hwy),
+      "car_gps": self._car_gps,           # cargps2pnw: Ford only; None on the Tesla
       # VTSC applied cap + state (from the VTSCStatus mem param) — without this channel the 2026-07-06
       # I-84 gas-override cluster couldn't be attributed (VTSC/MTSC vs CES) from the log alone.
       "vtscCap": self._vtsc_cap, "vtscState": self._vtsc_state, **getattr(self, "_vtsc_tele", {}),
