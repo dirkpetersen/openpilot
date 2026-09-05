@@ -22,6 +22,9 @@ struct LoggerdState {
   // state, so an externally hand-set GearPark is never corrected and would silently discard driving
   // video for the rest of a drive. Param = enable, CAN = truth.
   bool car_parked = false;
+  // parkedlog2pnw: cached once per segment (see logger_rotate) -- a param read per minute is free,
+  // a param read per message at 100 Hz is not.
+  bool thin_parked_rlog = false;
   uint64_t carstate_decim = 0;   // unsigned: wraps defined, no signed-overflow UB at 100 Hz
   std::atomic<int> ready_to_rotate{0};  // count of encoders ready to rotate
   int max_waiting = 0;
@@ -29,6 +32,13 @@ struct LoggerdState {
 };
 
 void logger_rotate(LoggerdState *s) {
+  // parkedlog2pnw: refresh the parked-rlog gate once per segment, same cadence and same
+  // fail-toward-RECORDING contract as SkipVideoWhenParked above.
+  try {
+    s->thin_parked_rlog = Params().getBool("ThinRlogWhenParked");
+  } catch (...) {
+    s->thin_parked_rlog = false;   // never lose driving data to a params hiccup
+  }
   bool ret =s->logger.next();
   assert(ret);
   s->ready_to_rotate = 0;
@@ -401,8 +411,35 @@ void loggerd_thread() {
           s.last_camera_seen_tms = millis_since_boot();
           bytes_count += handle_encoder_msg(&s, msg, service.name, remote_encoders[sock], encoder_infos_dict[service.name]);
         } else {
-          s.logger.write((uint8_t *)msg->getData(), msg->getSize(), in_qlog);
-          bytes_count += msg->getSize();
+          // parkedlog2pnw: while the shifter is in PARK, write ONLY what qlog would take.
+          //
+          // Why this is needed even with SkipVideoWhenParked on: that gate stops fcamera/ecamera,
+          // but a parked-and-charging Lightning still wrote qcamera + qlog + rlog = ~13 MB EVERY
+          // MINUTE (measured 2026-09-05: 58 segments in an hour, ~750 MB/h, ~18 GB/day sitting in a
+          // driveway). rlog is ~10 MB of that. With /data at 90% the upload queue could never drain
+          // -- the uploaded count literally went BACKWARDS (738 -> 734) as the deleter cleared
+          // uploaded segments while the recorder added un-uploaded ones faster.
+          //
+          // Thinning rather than dropping: rlog keeps whatever qlog takes, so the file stays valid
+          // and parseable and a charging session still leaves a ~1 Hz breadcrumb -- just at qlog
+          // rate instead of full rate. Nothing downstream has to learn about a missing file.
+          //
+          // qcamera is deliberately NOT touched here (see the encoder gate above): it is the only
+          // encoder with include_audio, and starving it flushes ~10 s of stale parked frames into
+          // the NEXT (driving) segment's video. That failure class stays unreachable.
+          //
+          // Rotation is TIME-based (rotate_if_needed: seg_length_secs > SEGMENT_LENGTH), not
+          // byte-based, so suppressing writes cannot stall or stretch a segment. bytes_count is
+          // only advanced for bytes actually written, so the log-rate stat stays honest.
+          //
+          // Fails toward RECORDING in every direction: the param defaults OFF, a params error
+          // leaves it false, and car_parked requires an affirmative 'park' parse (any other gear,
+          // including the capnp default 'unknown', records at full rate).
+          const bool thin = s.car_parked && s.thin_parked_rlog && !in_qlog;
+          if (!thin) {
+            s.logger.write((uint8_t *)msg->getData(), msg->getSize(), in_qlog);
+            bytes_count += msg->getSize();
+          }
           delete msg;
         }
 

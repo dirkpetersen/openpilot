@@ -169,6 +169,17 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"OnPriorityNetwork", {CLEAR_ON_MANAGER_START, BOOL, "0"}},  // uploadgate2pnw: network_arbiterd sets True while joined to a priority (home) SSID; pass-2 (rlog/HD) uploads run ONLY there (driver spec 2026-07-13)
     {"GearPark", {CLEAR_ON_MANAGER_START, BOOL, "0"}},  // uploadgate2pnw: card's change-only "gear is in Park" flag; lets background procs gate on parked WITHOUT a 100Hz carState msgq sub (2026-07-13 commIssue lesson)
     {"SkipVideoWhenParked", {PERSISTENT, BOOL, "0"}},  // parkedvideo2pnw: skip writing fcamera/ecamera .hevc for any segment recorded while GearPark is set. The Lightning holds its ignition line live while parked/charging, so IsOnroad stays 1 and loggerd wrote ~145 MB/min of a stationary truck, pinning /data at the deleter threshold and evicting real drive footage. Gates ONLY the video writer -- rlog/qlog and segment rotation are untouched. Default OFF (no behaviour change); enable per-device.
+    // parkedlog2pnw: sibling of SkipVideoWhenParked, for the bytes that gate does NOT stop. With
+    // video skipped a parked/charging Lightning still wrote qcamera+qlog+rlog = ~13 MB EVERY MINUTE
+    // (measured 2026-09-05: 58 segments/h, ~750 MB/h, ~18 GB/day in a driveway), of which rlog is
+    // ~10 MB. With /data at 90% the upload queue could never drain -- uploaded counts went BACKWARDS
+    // as the deleter cleared uploaded segments faster than uploads completed. When set, loggerd
+    // writes ONLY the messages qlog would take while gearShifter == park, so rlog stays a valid,
+    // parseable ~1 Hz breadcrumb of the charging session instead of a full-rate log of a stationary
+    // truck. qcamera is deliberately untouched (starving it flushes stale parked frames into the
+    // next driving segment's video -- see loggerd.cc). Rotation is time-based so nothing stalls.
+    // Default OFF (no behaviour change); enable per-device, like its sibling above.
+    {"ThinRlogWhenParked", {PERSISTENT, BOOL, "0"}},
     {"SkipWideCameraUpload", {PERSISTENT, BOOL, "0"}},  // uploadprio2pnw: skip uploading the WIDE road camera (ecamera.hevc) in pass 2 -- half the video bytes of the pass-2 backlog. Skipped-not-marked (never xattr-stamped), so the files upload again as soon as this goes back off -- BUT note the deleter also stops counting ecamera as "un-uploaded" while this is on (uploadable_firehose_files), which is the point (it frees those segments for reclaim), so under disk pressure some skipped ecamera files will have been deleted by then. Destruction of any never-uploaded firehose file is still logged at ERROR. Unlike DeferHDVideoUpload, which is a temporary hold and keeps its full deleter protection. Default OFF (no behaviour change).
     {"LastUploadError", {CLEAR_ON_MANAGER_START, STRING}},  // uploadretry2pnw: last hard upload failure (HTTP status/exc) for the CES overlay, change-only; removed on next success + on startup
     {"DmMode", {PERSISTENT, INT, "0"}},  // dmroad2pnw: 3-way driver-monitoring timeout selector. 0=Off (stock strict everywhere), 1=Highway (900s pose/1800s phone on freeway or divided-2-lane, stock elsewhere), 2=Relaxed (10800s/3600s everywhere). Default OFF. Does NOT touch the glare knobs.
