@@ -283,3 +283,81 @@ def test_limit_counter_is_telemetry_only_and_counts_real_clips(tmp_path, monkeyp
   ctl.reset()
   assert ctl._correction == 0.0
   assert ctl._roc_limited_ticks == before
+
+
+# --- lcramp2pnw: speed-scheduled authority -----------------------------------------------------
+# BluePilot ramps lane centering 0 -> full between 9 and 15 m/s; we had a hard on/off at min_v_ego
+# (5.0) with FULL authority immediately above it. The driver report is "after a slow tight curve the
+# Tesla is definitely over steering", and 5-15 m/s is exactly the band where they de-authorize and we
+# did not. The ramp can only ever REDUCE authority: it is 1.0 at and above authority_ramp_full.
+
+RS = DEFAULT_TUNING["authority_ramp_start"]   # 9.0 m/s
+RF = DEFAULT_TUNING["authority_ramp_full"]    # 15.0 m/s
+
+
+def test_highway_authority_is_completely_unchanged(tmp_path, monkeypatch):
+  """The whole ramp must be inert above authority_ramp_full -- this change is not allowed to alter
+  behavior at the speeds the car spends most of its time at."""
+  for v in (RF, RF + 0.01, 20.0, 35.0):
+    ctl = _ctl(tmp_path, monkeypatch)
+    assert ctl._speed_authority(v, DEFAULT_TUNING) == 1.0, f"authority scaled at {v} m/s"
+
+
+def test_below_the_ramp_start_the_correction_is_fully_suppressed(tmp_path, monkeypatch):
+  """Between min_v_ego (5.0) and authority_ramp_start (9.0) we used to apply FULL authority."""
+  ctl = _ctl(tmp_path, monkeypatch)
+  model = _Model(lane_center=0.5)
+  out = _run(ctl, model, 400, v_ego=RS - 0.5)
+  assert out == pytest.approx(0.0, abs=1e-12), "correction applied below the ramp start"
+  assert ctl._speed_authority(RS - 0.5, DEFAULT_TUNING) == 0.0
+
+
+def test_the_ramp_is_linear_and_monotonic_across_the_band(tmp_path, monkeypatch):
+  ctl = _ctl(tmp_path, monkeypatch)
+  mid = ctl._speed_authority((RS + RF) / 2.0, DEFAULT_TUNING)
+  assert mid == pytest.approx(0.5, abs=1e-9), "midpoint of the ramp is not half authority"
+  prev = -1.0
+  for v in np.linspace(RS - 1.0, RF + 1.0, 40):
+    a = ctl._speed_authority(v, DEFAULT_TUNING)
+    assert 0.0 <= a <= 1.0
+    assert a >= prev - 1e-12, "authority is not monotonic in speed"
+    prev = a
+
+
+def test_slow_curve_authority_is_strictly_less_than_it_used_to_be(tmp_path, monkeypatch):
+  """THE point of the change: at 11 m/s (~25 mph, a slow tight curve) the applied correction must be
+  materially smaller than the un-ramped behavior, which is what `max_gain` alone would give."""
+  v = 11.0
+  ctl = _ctl(tmp_path, monkeypatch)
+  ramped = _run(ctl, _Model(lane_center=0.5), 1200, v_ego=v)
+  flat = _ctl(tmp_path, monkeypatch, {**DEFAULT_TUNING, "authority_ramp_start": 2.0,
+                                      "authority_ramp_full": 2.5})   # ramp effectively disabled
+  unramped = _run(flat, _Model(lane_center=0.5), 1200, v_ego=v)
+  assert abs(ramped) < abs(unramped), "the ramp did not reduce authority in the slow band"
+  assert abs(ramped) == pytest.approx(abs(unramped) / 3.0, rel=0.05), "expected 1/3 authority at 11 m/s"
+
+
+def test_json_cannot_invert_or_collapse_the_ramp(tmp_path, monkeypatch):
+  """An inverted or zero-width band would divide by zero, or read as 'full authority everywhere' --
+  the UN-safe direction. The sanitizer must fall back to BOTH defaults, not to either supplied end."""
+  for bad in ({"authority_ramp_start": 20.0, "authority_ramp_full": 10.0},
+              {"authority_ramp_start": 12.0, "authority_ramp_full": 12.0}):
+    ctl = _ctl(tmp_path, monkeypatch, {**DEFAULT_TUNING, **bad})
+    ctl.update(0.0, _Model(), V_EGO, True, True, True, False)
+    assert ctl._tuning["authority_ramp_start"] == RS
+    assert ctl._tuning["authority_ramp_full"] == RF
+
+
+def test_min_v_ego_still_gates_first(tmp_path, monkeypatch):
+  """The ramp shapes the region ABOVE min_v_ego; it must not resurrect the correction below it."""
+  ctl = _ctl(tmp_path, monkeypatch, {**DEFAULT_TUNING, "authority_ramp_start": 2.0,
+                                     "authority_ramp_full": 3.0})
+  out = _run(ctl, _Model(lane_center=0.5), 200, v_ego=DEFAULT_TUNING["min_v_ego"] - 0.5)
+  assert out == pytest.approx(0.0, abs=1e-12)
+  assert ctl.status["gate"] == "slow"
+
+
+def test_speed_authority_is_published_for_telemetry(tmp_path, monkeypatch):
+  ctl = _ctl(tmp_path, monkeypatch)
+  ctl.update(0.0, _Model(lane_center=0.3), 12.0, True, True, True, False)
+  assert ctl.status["spdA"] == pytest.approx(0.5, abs=1e-3), "spdA does not reflect the ramp"

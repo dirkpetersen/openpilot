@@ -97,6 +97,14 @@ DEFAULT_TUNING: dict[str, float | bool] = {
   "min_lane_prob": 0.6,           # minimum model confidence required in both adjacent lane lines
   "max_lane_std": 0.3,            # maximum model uncertainty (std) allowed in either lane line (m)
   "min_v_ego": 5.0,               # minimum speed before the correction is allowed to act (m/s)
+  # lcramp2pnw: speed-scheduled authority. BluePilot ramps lane centering 0 -> full between 9 and
+  # 15 m/s (_SPEED_RAMP_BP, af4bc410c9 lineage); we had a hard on/off at min_v_ego with FULL
+  # authority immediately above it. The driver report this addresses is "after a slow tight curve
+  # the Tesla is definitely over steering" -- 5-15 m/s is exactly the band where they have
+  # zero-to-partial authority and we had all of it. Purely de-authorizing: the multiplier is 1.0
+  # at and above authority_ramp_full, so nothing changes at highway speed.
+  "authority_ramp_start": 9.0,    # below this the correction is fully suppressed (m/s)
+  "authority_ramp_full": 15.0,    # at/above this the correction has full authority (m/s)
   "e2e_max_path_std": 0.35,       # E2E path uncertainty ceiling for the E2E-authority blend to apply
   "e2e_break_in_start": 0.15,     # center-error magnitude where E2E authority starts reducing the correction (m)
   "e2e_break_in_full": 0.50,      # center-error magnitude where E2E authority is fully applied (m)
@@ -175,6 +183,11 @@ _CLAMPS: dict[str, tuple[float, float]] = {
   # lookahead**2) get unstable. Capped at 40 m/s (~90 mph) purely so a fat-fingered huge value
   # can't silently read as "feature disabled" without anything showing why.
   "min_v_ego": (2.0, 40.0),
+  # Both ends of the authority ramp share min_v_ego's envelope: the ramp can be moved or flattened
+  # by JSON but never inverted (the sanitizer below enforces start < full), and a value at/below
+  # min_v_ego simply makes the ramp inert -- min_v_ego still gates first.
+  "authority_ramp_start": (2.0, 40.0),
+  "authority_ramp_full": (2.0, 40.0),
   "e2e_max_path_std": (0.0, 1.0),    # E2E path uncertainty ceiling, METERS (see max_lane_std note)
   "e2e_break_in_start": (0.0, 1.0),  # center-error magnitude, METERS, where the E2E veto starts
   "e2e_break_in_full": (0.0, 1.0),   # center-error magnitude, METERS, where the E2E veto is full
@@ -245,6 +258,13 @@ def _sanitize_tuning(raw: dict) -> dict[str, float | bool]:
     else:
       lo, hi = _CLAMPS[key]
       out[key] = _clamp(value, lo, hi, float(default))
+
+  # Invariant: the authority ramp must have positive width, or the interpolation divides by zero.
+  # An inverted or degenerate band would also read as "full authority everywhere", which is the
+  # UN-safe direction, so fall back to both defaults rather than to either supplied value.
+  if out["authority_ramp_start"] >= out["authority_ramp_full"]:
+    out["authority_ramp_start"] = DEFAULT_TUNING["authority_ramp_start"]
+    out["authority_ramp_full"] = DEFAULT_TUNING["authority_ramp_full"]
 
   # Invariant: lane-width band must be non-empty, or every lane-line read gets rejected forever.
   if out["min_lane_width"] >= out["max_lane_width"]:
@@ -351,6 +371,7 @@ class LaneCenteringController:
       "w": None,       # apparent lane width at lookahead (m)
       "v": 0.0,        # v_ego (m/s)
       "limN": 0,       # cumulative ticks the correction_roc cap actually clipped (see update())
+      "spdA": 1.0,     # lcramp2pnw: speed-authority multiplier applied this tick (1.0 = unscaled)
     }
 
   def _finish_status(self, gate: str, v_ego) -> None:
@@ -550,7 +571,13 @@ class LaneCenteringController:
     # Clamp the raw (pre-gain) correction to the hard safety ceiling, THEN apply the gain. Doing the
     # clamp before the gain means max_gain can never be used to smuggle a bigger raw signal through —
     # the two multipliers are independent hard stops, not one combined budget.
-    target = float(np.clip(raw_correction, -t["max_raw_correction"], t["max_raw_correction"])) * t["max_gain"]
+    # lcramp2pnw: scale by the speed-authority ramp BEFORE the filter, so the limiter and the
+    # exponential both see the already-de-authorized target rather than chasing a value the ramp
+    # would then cut. The multiplier is 1.0 at/above authority_ramp_full, so highway behavior is
+    # bit-identical to before this change.
+    speed_auth = self._speed_authority(v_ego, t)
+    self.status["spdA"] = round(speed_auth, 4)
+    target = float(np.clip(raw_correction, -t["max_raw_correction"], t["max_raw_correction"])) * t["max_gain"] * speed_auth
     filtered = float(smooth_value(target, self._correction, t["smooth_tau"], dt=DT_CTRL))
 
     # Why a SECOND limiter on top of smooth_tau (ported from BluePilot af4bc410c9).
@@ -616,6 +643,20 @@ class LaneCenteringController:
       return model_curvature
     self._finish_status("ok", v_ego)
     return model_curvature + self._correction
+
+  @staticmethod
+  def _speed_authority(v_ego, t) -> float:
+    """lcramp2pnw: linear 0 -> 1 authority ramp across [authority_ramp_start, authority_ramp_full].
+
+    Returns a multiplier in [0, 1], never above 1.0, so this can only ever REDUCE the correction
+    relative to the previous hard-on/off behavior. Callers must still apply min_v_ego separately;
+    this does not replace that gate, it shapes the region above it.
+    """
+    lo = float(t["authority_ramp_start"])
+    hi = float(t["authority_ramp_full"])
+    if not (hi > lo):                      # sanitizer guarantees this, belt-and-braces for a direct call
+      return 1.0
+    return float(np.clip((float(v_ego) - lo) / (hi - lo), 0.0, 1.0))
 
   @staticmethod
   def _valid_path(x, y) -> bool:
