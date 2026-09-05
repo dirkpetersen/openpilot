@@ -1,3 +1,8 @@
+---
+updated: 2026-07-13          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # DMROAD2PNW — road-gated 3-way driver-monitoring timeout selector
 
 > **⚠️ SUPERSEDED IN PART by `DM-VARIABLE.md` (branch `dm-variable`, 2026-07-11):** the Highway/

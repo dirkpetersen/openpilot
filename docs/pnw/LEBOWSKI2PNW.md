@@ -1,3 +1,8 @@
+---
+updated: 2026-07-13          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # LEBOWSKI2PNW — port the commaai-master modeld stack + lebowski driving model
 
 **STATUS: DEPLOYED 2026-07-09** — merged to `4devpnw`, live on the 3X @ **`09fcf8cf2d`**. On-device

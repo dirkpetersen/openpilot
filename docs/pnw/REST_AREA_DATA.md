@@ -1,3 +1,8 @@
+---
+updated: 2026-07-18          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # REST_AREA_DATA — the location-services rest-area corridor data
 
 **Status:** BUILT + DEPLOYED on `4devpnw` (`pnw/pnw-pilot`), live on the 3X. This is the shipped

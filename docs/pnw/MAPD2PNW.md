@@ -1,3 +1,8 @@
+---
+updated: 2026-08-15          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # MAPD2PNW — foundational mapd infrastructure for PNW (on-demand per-location download)
 
 > # ⛔ SUPERSEDED — see `MAPD-SYSTEM.md`

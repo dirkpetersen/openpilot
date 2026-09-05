@@ -1,3 +1,8 @@
+---
+updated: 2026-08-13          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # pnw-pilot — Waze police-alert API key
 
 pnw-pilot shows **police reports ahead** (Waze data, via OpenWebNinja) on the "Happening Ahead"

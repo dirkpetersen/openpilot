@@ -1,3 +1,8 @@
+---
+updated: 2026-07-19          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # Gemini review — angle2pnw-faithful2
 
 - **Model:** `gemini-pro-latest` (Google Gemini CLI, `@google/gemini-cli` v0.46+)

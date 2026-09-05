@@ -1,3 +1,8 @@
+---
+updated: 2026-07-19          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # angle2pnw-faithful2 — deviation manifest
 
 **Audience: Alan Polk.** This document lists every place our port of your bp-7.0 Ford

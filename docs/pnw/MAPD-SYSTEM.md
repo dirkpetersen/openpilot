@@ -1,3 +1,8 @@
+---
+updated: 2026-08-15          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # MAPD-SYSTEM.md — the AS-DEPLOYED mapd architecture (PNW production)
 
 > # 🟢 DEPLOYED — `mapdstate2pnw` branch (`~/gh/comma/pnw/pnw-pilot`)

@@ -1,3 +1,8 @@
+---
+updated: 2026-07-18          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # GLARE.md — Addressing driver-monitoring glare false-positives
 
 **Status:** analysis + recommended plan; **Layer C band-aid DEPLOYED 2026-07-06** (`4devpnw` @

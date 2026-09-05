@@ -1,3 +1,8 @@
+---
+updated: 2026-08-12          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # LATACCEL2PNW — speed-scheduled, JSON-tunable lateral-accel cap
 
 Branch: `lataccel2pnw` (based on `origin/3devpnw`). Touches

@@ -1,3 +1,8 @@
+---
+updated: 2026-07-18          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # DM-CURRENT — as-deployed driver monitoring (single source of truth)
 
 **STATUS (2026-07-12): dm-variable SHIPPED** — merged to **`3devpnw`** (`d0cc222be4` + UI follow-ups

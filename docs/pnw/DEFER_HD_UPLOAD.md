@@ -1,3 +1,8 @@
+---
+updated: 2026-07-18          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # DEFER_HD_UPLOAD — "Defer HD Video Upload" toggle
 
 **Branch:** `4devpnw` (in `pnw/pnw-pilot`; code tagged `connect2pnw`) · **Status:** implemented,

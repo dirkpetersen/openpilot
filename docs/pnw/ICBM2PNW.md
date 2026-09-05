@@ -1,3 +1,8 @@
+---
+updated: 2026-08-11          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # ICBM2PNW — Intelligent Cruise Button Management (F-150 Lightning, stock ACC)
 
 **Status: DEPLOYED, heavily evolved over 2026-07-11/12.** Promoted 2026-07-11 (dec-only v1); then a

@@ -1,3 +1,8 @@
+---
+updated: 2026-07-13          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # UPSTREAM2PNW — commaai/master picks for a new dev branch
 
 **STATUS: Tier 1 + Tier 2 PICKED 2026-07-08** — all 15 picks + 1 dependency + 1 adaptation are on

@@ -1,3 +1,8 @@
+---
+updated: 2026-07-13          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # FORDSAFETY2PNW — BluePilot 4-signal Ford lateral + hardened panda safety (F-150 Lightning)
 
 **Status: DEPLOYED 2026-07-11** (driver-authorized panda reflash; controlled first drive done same

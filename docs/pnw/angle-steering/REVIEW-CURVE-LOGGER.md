@@ -1,3 +1,8 @@
+---
+updated: 2026-07-19          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # REVIEW-CURVE-LOGGER — pre-deployment review of `scripts/angle_curve_logger.py`
 
 **Date:** 2026-07-19 · **Reviewer:** analysis session (Claude) · **Scope:** the curve-triggered

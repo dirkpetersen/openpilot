@@ -1,3 +1,8 @@
+---
+updated: 2026-07-19          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # REVIEW-FABLE — adversarial review of `angle2pnw-faithful2` (pnw-opendbc 05938869)
 
 Reviewer: Fable (first of two independent reviewers; Gemini is the second).

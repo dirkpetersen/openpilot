@@ -1,3 +1,8 @@
+---
+updated: 2026-07-18          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # REST_AREAS.md — can mapd surface rest areas along the highway? (feasibility)
 
 **Question (2026-06-23):** can the **pfeiferj mapd** component (the Go binary openpilot shells out to

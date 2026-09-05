@@ -1,3 +1,8 @@
+---
+updated: 2026-07-13          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # SHARPCURVE2PNW — earlier + smoother curve slowdown (blind sharp-curve take-control fix)
 
 Branch: **`sharpcurve2pnw`** (off `4devpnw`). Touches only `selfdrive/controls/lib/vtsc_pnw/`

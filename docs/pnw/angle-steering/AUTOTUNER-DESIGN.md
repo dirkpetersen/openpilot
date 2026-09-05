@@ -1,3 +1,8 @@
+---
+updated: 2026-07-19          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # AUTOTUNER-DESIGN — self-tuning for the bp-7.0 angle-control port (design review, no code)
 
 **Date:** 2026-07-19 · **Author:** analysis session (Claude), on driver request

@@ -1,3 +1,8 @@
+---
+updated: 2026-07-18          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # CES2PNW — Conditional Experimental Switching + VTSC + mapd ported to pnwtest3
 
 **Branch:** `ces2pnw` (off `pnwtest3`, openpilot v0.11.2) · pushed to `origin/dirkpetersen/pnw-pilot`.

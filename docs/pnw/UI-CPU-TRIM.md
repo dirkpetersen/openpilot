@@ -1,3 +1,8 @@
+---
+updated: 2026-07-18          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # UI-CPU-TRIM.md — trimming the on-device UI process CPU load
 
 **Status:** 🆕 investigation + proposal (2026-07-13). **Nothing here is deployed.** Read-only device

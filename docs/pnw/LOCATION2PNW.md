@@ -1,3 +1,8 @@
+---
+updated: 2026-07-13          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # LOCATION2PNW.md — "Happening Ahead" location services (display-only)
 
 **Branch:** `location2pnw` (off `4devpnw`). **Spec:** `~/gh/comma/other/waze-test/LOCATION_SERVICES_DESIGN.md`.

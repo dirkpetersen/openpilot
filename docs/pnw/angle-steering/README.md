@@ -1,3 +1,8 @@
+---
+updated: 2026-09-05          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # Angle steering (BluePilot bp-7.0 port) — document set
 
 Everything on the faithful port of **Alan Polk's BluePilot 7.0 path-angle-primary lateral control**

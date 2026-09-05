@@ -1,3 +1,8 @@
+---
+updated: 2026-08-16          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # op-long-features — what each car can do with longitudinal control ON vs OFF
 
 **Audience:** the driver, deciding how to configure a drive. **Scope:** every PNW feature, mapped to

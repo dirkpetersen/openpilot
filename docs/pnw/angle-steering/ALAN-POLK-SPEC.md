@@ -1,3 +1,8 @@
+---
+updated: 2026-07-19          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # Alan Polk / BluePilot 7.0 angle control — THE AUTHORITATIVE SPEC (from his own writing)
 
 **Source articles (archived verbatim in `alan-polk-articles/`; fetch fresh via the WordPress REST API,

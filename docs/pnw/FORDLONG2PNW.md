@@ -1,3 +1,8 @@
+---
+updated: 2026-07-13          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # FORDLONG2PNW — BluePilot highway follow control (LongitudinalExt) on the Lightning
 
 **Status: DEPLOYED on `3devpnw`** (opendbc `master-pnw` `45d5b19c`, pin `e8f35e3e32`; city-hop fix

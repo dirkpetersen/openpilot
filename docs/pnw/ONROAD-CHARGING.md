@@ -1,3 +1,8 @@
+---
+updated: 2026-07-18          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # ONROAD-CHARGING.md — the "parked & charging counts as onroad" problem
 
 **Status:** 🆕 design investigation (2026-07-13). **No code changed, nothing deployed.** This doc

@@ -1,3 +1,8 @@
+---
+updated: 2026-07-13          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # CES_I90.md — curve-braking learnings from the I-90 / Snoqualmie Pass drive
 
 **Branch:** `ces-i90-2pnw` (off `4devpnw`, base `3d87fe68`).

@@ -1,3 +1,8 @@
+---
+updated: 2026-08-15          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # PNW design docs
 
 PNW-specific feature/effort design docs (moved here from the repo root 2026-07-13 to declutter).

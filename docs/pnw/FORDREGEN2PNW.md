@@ -1,3 +1,8 @@
+---
+updated: 2026-07-18          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # FORDREGEN2PNW — Highway follow jerkiness / regen over-decel on the F-150 Lightning (op-long)
 
 **Status: DESIGN ONLY (2026-07-13). Nothing built, nothing deployed, device untouched.**

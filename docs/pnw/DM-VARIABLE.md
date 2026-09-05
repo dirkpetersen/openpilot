@@ -1,3 +1,8 @@
+---
+updated: 2026-07-13          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # DM-VARIABLE — JSON-configurable driver-monitoring timeout tiers
 
 **STATUS: MERGED to `3devpnw` 2026-07-12** (`d0cc222be4`) and riding the device's auto-update channel.

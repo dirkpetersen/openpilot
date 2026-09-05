@@ -1,3 +1,8 @@
+---
+updated: 2026-07-19          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # Sign-convention trace — angle2pnw-faithful2
 
 **Purpose:** prove, frame by frame, that this port did not repeat whatever caused the previous

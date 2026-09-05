@@ -1,3 +1,8 @@
+---
+updated: 2026-07-13          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # CURVESLOW2PNW — the Lightning slows MORE for curves (per-car curve-speed penalty)
 
 **Status: DEPLOYED on `3devpnw`** — branches `curveslow-lightning` (`175cc19379` → `4ffc737570` →

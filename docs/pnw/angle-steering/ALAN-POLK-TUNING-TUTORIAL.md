@@ -1,3 +1,8 @@
+---
+updated: 2026-07-19          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # Alan Polk's angle-steering tuning method — from his own two videos
 
 Source: `sunny/bluepilot-videos/videoplayback{1,2}.mp4` (transcribed 2026-07-19 with whisper;

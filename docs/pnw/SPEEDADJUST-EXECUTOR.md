@@ -1,3 +1,8 @@
+---
+updated: 2026-08-11          # git-derived; bump when you edit this file
+status: unreviewed     # current | drifted | superseded | unreviewed
+---
+
 # SPEEDADJUST-EXECUTOR — unified stock-ACC button management (icbm2pnw + speedadjust2pnw)
 
 **Status: BUILT, NOT YET DEPLOYED / NOT ROAD-TESTED.** Written 2026-08-11 on branches
