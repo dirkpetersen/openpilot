@@ -120,14 +120,9 @@ DESCRIPTIONS = {
     "steering-wheel nudge everywhere, highway included. Keep your hands on the wheel and check your " +
     "surroundings. Tesla and the Ford F-150 Lightning only — other cars always require the nudge."
   ),
-  "NoDisengageOnBrake": tr_noop(
-    "Keep openpilot engaged when you press the brake pedal instead of disengaging. " +
-    "openpilot will resume controlling speed as soon as you release the brake. " +
-    "Not currently supported on any car here (Ford or Tesla) — this toggle is disabled."
-  ),
   # mads2pnw: INVERTED-POLARITY toggle (same idiom as DisableLaneCentering / NoFordAngleSteering).
   # OFF (the shipping default) = steering survives the brake. ON = stock. It is the working
-  # replacement for the (greyed, never-supported) NoDisengageOnBrake toggle above.
+  # replacement for the never-supported NoDisengageOnBrake toggle, removed in nobrakekey2pnw.
   "DisengageOnBrake": tr_noop(
     "When you press the brake pedal, also stop STEERING. This is ON in stock openpilot. " +
     "Turn it OFF and openpilot keeps steering through a brake press -- braking still hands the " +
@@ -220,12 +215,6 @@ class TogglesLayout(Widget):
         lambda: tr("Nudge for Lane Change"),
         DESCRIPTIONS["NudgeForLaneChange"],
         "warning.png",
-        False,
-      ),
-      "NoDisengageOnBrake": (
-        lambda: tr("No Disengage on Braking"),
-        DESCRIPTIONS["NoDisengageOnBrake"],
-        "disengage_on_accelerator.png",
         False,
       ),
       # mads2pnw: INVERTED — OFF (default) = steering survives the brake, ON = stock. needs_restart
@@ -549,16 +538,12 @@ class TogglesLayout(Widget):
       self._toggles["NudgeForLaneChange"].action_item.set_enabled(nudgeless_ok)
       if not nudgeless_ok:
         self._toggles["NudgeForLaneChange"].action_item.set_state(True)
-    if "NoDisengageOnBrake" in self._toggles:
-      self._toggles["NoDisengageOnBrake"].action_item.set_enabled(False)
-      self._toggles["NoDisengageOnBrake"].action_item.set_state(False)
-
     # mads2pnw: "Disengage on brake" is INVERTED — OFF means "keep steering through the brake".
     # It is only operable when BOTH:
     #   * this car has the mads_lateral capability (PnwVehicle; today the Lightning), and
     #   * PandaMadsSafety says the panda CURRENTLY FLASHED carries controls_allowed_lateral.
     # The panda gate is the safety-critical half. With a stock panda, "OFF" would be the exact
-    # half-state the (permanently greyed) NoDisengageOnBrake toggle above exists to prevent, so
+    # half-state the removed NoDisengageOnBrake toggle used to CREATE (nobrakekey2pnw), so
     # grey it and paint it ON (stock). DISPLAY ONLY — deliberately no put_bool, for the same
     # shared-device reason spelled out under the angle-steering clamp below: this is ONE physical
     # device moved between the Tesla and the Lightning, and persisting a clamp would silently

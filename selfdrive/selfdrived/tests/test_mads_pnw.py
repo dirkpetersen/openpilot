@@ -738,3 +738,54 @@ class TestPandadHeartbeatPlumbing:
   def test_the_disengage_reason_is_published(self):
     src = (self.PANDAD / "pandad.cc").read_text()
     assert "ps.setMadsDisengageReason(health.mads_disengage_reason_pkt);" in src
+
+
+class TestNoDisengageOnBrakeIsGone:
+  """nobrakekey2pnw: the auto2pnw NoDisengageOnBrake path is removed ENTIRELY, not just greyed.
+
+  It cleared selfdrived's own brake_disengage while the panda still cleared controls_allowed on the
+  same press (generic_rx_checks, outside the whitelist guard). That half-state fed mismatch_counter
+  at 100 Hz -> controlsMismatch IMMEDIATE_DISABLE at 2.0 s. Greying the toggle did NOT disarm it: the
+  param was still read in selfdrived, so `echo 1 > /data/params/d/NoDisengageOnBrake` armed the real
+  suppression on ANY car, the Tesla included. MADS replaces it correctly, with a second panda-side
+  authority the brake does not clear.
+  """
+
+  @staticmethod
+  def _root():
+    import pathlib
+    return pathlib.Path(__file__).resolve().parents[3]
+
+  def test_no_live_reader_anywhere(self):
+    """A comment may name it; nothing may READ it."""
+    import pathlib
+    root = self._root()
+    offenders = []
+    for pat in ("**/*.py", "**/*.cc", "**/*.h"):
+      for f in root.glob(pat):
+        if any(x in f.parts for x in (".git", "site-packages", ".venv", "third_party", "tests")):
+          continue        # a test that names the symbol is not a reader -- including this one
+        try:
+          text = f.read_text(errors="ignore")
+        except OSError:
+          continue
+        for i, line in enumerate(text.splitlines(), 1):
+          if "NoDisengageOnBrake" not in line and "no_disengage_on_brake" not in line:
+            continue
+          stripped = line.strip()
+          if stripped.startswith("#") or stripped.startswith("//"):
+            continue          # comments are fine -- they record why it went
+          offenders.append(f"{f.relative_to(root)}:{i}: {stripped}")
+    assert not offenders, "live NoDisengageOnBrake reference(s) survived:\n" + "\n".join(offenders)
+
+  def test_param_key_removed(self):
+    keys = (self._root() / "common/params_keys.h").read_text()
+    assert '"NoDisengageOnBrake"' not in keys, "param key still declared -- a raw write could still arm it"
+    assert '"DisengageOnBrake"' in keys, "the MADS toggle's key must remain"
+
+  def test_brake_still_disengages_by_default(self):
+    """The removal must not weaken the stock path: a brake press still raises pedalPressed."""
+    src = (self._root() / "selfdrive/selfdrived/selfdrived.py").read_text()
+    assert "brake_disengage = (CS.brakePressed" in src
+    assert "or brake_disengage:" in src
+    assert "brake_disengage = False" not in src, "an unconditional suppression must not exist"

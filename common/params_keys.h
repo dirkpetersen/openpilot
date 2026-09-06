@@ -129,7 +129,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // migrates an existing device's NudgelessLaneChange value into this key once (see
     // TogglesInvertedMigrated) so upgrading never flips anyone's live behavior.
     {"NudgeForLaneChange", {PERSISTENT, BOOL, "0"}},
-    {"NoDisengageOnBrake", {PERSISTENT, BOOL, "0"}},   // auto2pnw: stay engaged through brake (unsupported here; toggle greyed)
     // mads2pnw: INVERTED-POLARITY toggle, same idiom as DisableLaneCentering / NoFordAngleSteering.
     // Ships "0" (satisfying the default-OFF rule) and "0" is ALSO the new behaviour: OFF = openpilot
     // does NOT disengage lateral on brake (steering survives the brake press, MADS REMAIN_ACTIVE);
