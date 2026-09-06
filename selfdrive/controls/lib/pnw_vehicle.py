@@ -306,6 +306,14 @@ class PnwVehicle:
     # wants to name the feature rather than the umbrella mechanism (e.g. future UI/telemetry).
     self.speedadjust_buttons: bool = self.button_management
 
+    # mads2pnw: "lateral survives a brake press" (sunnypilot MADS's controls_allowed_lateral).
+    # The Lightning runs STOCK ACC, so steering is the ONLY thing openpilot does for it and a brake
+    # tap today takes away everything. The Raven is excluded on a CAPABILITY basis, not because it
+    # is a Tesla: its EPS inhibits itself (EAC_INHIBITED) on a brake press, so a parallel panda-side
+    # lateral authority would buy it nothing — and it already keeps openpilot longitudinal, so a
+    # brake tap does not leave it with nothing. Every other car: False.
+    self.mads_lateral: bool = fp == "FORD_F_150_LIGHTNING_MK1"
+
     # nudgeless (blinker-hold) lane change support — BSM-gated in DesireHelper
     self.nudgeless: bool = brand == "tesla" or fp == "FORD_F_150_LIGHTNING_MK1"
 

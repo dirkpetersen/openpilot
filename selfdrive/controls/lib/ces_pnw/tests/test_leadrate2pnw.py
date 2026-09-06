@@ -35,6 +35,7 @@ feature added straight out of the real source files and exec's them in a small s
 proving the literal shipped code (not a reimplementation of it) is correct, without needing the full
 package import chain or pytest's conftest at all.
 """
+import pytest
 import ast
 import math
 import textwrap
@@ -172,11 +173,13 @@ class _SteerLogHarness:
     self.captured.append(rec)
 
 
-def _run_steer_log_step(cur_lat, cur_lon, cur_bearing, sm, v_ego=20.0):
+def _run_steer_log_step(cur_lat, cur_lon, cur_bearing, sm, v_ego=20.0, **attrs):
   src, tree, ns = _ces_pnw_globals()
   ns["C"] = _TickConst
   exec(compile(_extract_func(src, tree, "_steer_log_step"), "<steer_log_step>", "exec"), ns)
   harness = _SteerLogHarness(cur_lat, cur_lon, cur_bearing)
+  for k, v in attrs.items():        # let a test seed controller state before the step runs
+    setattr(harness, k, v)
   ns["_steer_log_step"](harness, _FakeCarState(v_ego), sm)
   return harness
 
@@ -757,3 +760,22 @@ def test_ces_pnw_alert_never_assigns_control_state():
   src, tree = _parse(CES_PNW_PATH)
   fn_src = _extract_alert_method(src, tree)
   _assert_no_control_writes(fn_src)
+
+
+def test_steer_record_carries_lcSpdA_and_car_gps():
+  """The steer record is a SECOND emit path, separate from _event_record. Mutation M9b (nulling
+  `lcSpdA` here) survived the whole suite even after the tick-path test existed, because nothing
+  asserted this record's copy. Same class of gap as waysel2pnw: a field present on one channel and
+  silently absent on the other."""
+  sm = {"radarState": type("RS", (), {"leadOne": _FakeLead(True, dRel=42.3, vLead=18.7)})()}
+  harness = _run_steer_log_step(47.6, -122.3, 90.0, sm)
+  rec = harness.captured[0]
+  assert "lcSpdA" in rec, "lcSpdA missing from the STEER record (present on the tick record only)"
+  assert "car_gps" in rec, "car_gps missing from the STEER record"
+
+
+def test_steer_record_lcSpdA_tracks_the_controller():
+  """A hardcoded None would satisfy the presence check above."""
+  sm = {"radarState": type("RS", (), {"leadOne": _FakeLead(True, dRel=42.3, vLead=18.7)})()}
+  h = _run_steer_log_step(47.6, -122.3, 90.0, sm, _lc_spd_a=0.42)
+  assert h.captured[0]["lcSpdA"] == pytest.approx(0.42)
