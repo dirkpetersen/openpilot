@@ -140,6 +140,12 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // to set. While it is 0, card.py sends alternativeExperience=0 (stock panda behaviour) and the
     // UI greys "Disengage on brake" forced to ON/stock. NEVER infer this from a fingerprint.
     {"PandaMadsSafety", {PERSISTENT, BOOL, "0"}},
+    // madsresume2pnw: may openpilot tap the stock ACC's RESUME button once, on the driver's behalf,
+    // after a brake press left MADS steering alone? This is SELF-ENGAGEMENT (lateral authority
+    // unlocking a longitudinal re-engagement), so it is default OFF per this fork's rule and is the
+    // driver's kill switch for the whole feature. Inert on any car without mads_resume, and inert
+    // whenever madsState.available is false. See docs/pnw/MADSRESUME2PNW.md.
+    {"MadsAutoResume", {PERSISTENT, BOOL, "0"}},
     // lanecenter2pnw: small bounded curvature trim toward lane-line center. Deliberately an OPT-OUT
     // (default "0" = NOT disabled = feature ON), the one exception to this fork's "new toggles
     // default OFF" rule — see selfdrive/controls/lib/lane_centering.py + toggles.py for why (the
@@ -220,6 +226,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"CESButtonState", {CLEAR_ON_MANAGER_START, INT, "0"}},  // ces2xnor: 0=CES 1=Chill 2=Exp (per-drive)
     {"CESStatus", {CLEAR_ON_MANAGER_START, JSON}},  // ces2xnor: live telemetry (selfdrived -> UI overlay)
     {"IcbmTarget", {CLEAR_ON_MANAGER_START, JSON}}, // icbm2pnw: stock-ACC set-speed target (ces brain -> ford carcontroller executor), mem-param
+    {"MadsResumeTarget", {CLEAR_ON_MANAGER_START, JSON}}, // madsresume2pnw: the bounded auto-resume OFFER (selfdrived brain -> ford carcontroller executor), mem-param. Shape {"dir":"res","ts":<heartbeat>,"eid":<episode id>,"set":<driver's captured set speed m/s>} -- DELIBERATELY a different shape and a different parser from IcbmTarget/SpeedAdjustTarget: a resume happens when cruise is OFF, a set-speed tap when it is ON, so neither may ever be read as the other.
     {"SpeedAdjustTarget", {CLEAR_ON_MANAGER_START, JSON}}, // speedadjust-exec2pnw: stock-ACC set-speed target for police/limit reduce-only caps (speedadjust brain -> ford carcontroller executor, arbitrated there against IcbmTarget), mem-param. Same {target,ceiling,ts,dir?} shape as IcbmTarget.
     {"FordLatStatus", {CLEAR_ON_MANAGER_START, JSON}}, // fordlatui2pnw: which lateral path is live (opendbc ford carcontroller -> UI mismatch warning), mem-param. Was previously UNREGISTERED (caught by the release-prep params check 2026-07-20) -- the UI read silently swallowed UnknownKeyName, so the mismatch warning was permanently dead.
     {"VTSCStatus", {CLEAR_ON_MANAGER_START, JSON}}, // vtsc: live status (plannerd -> UI overlay). Gated on the CES toggle.
