@@ -51,6 +51,14 @@ def _record(**over):
   # the fields under test, overridable per-case
   g._icbm_floor_lim = 11.2
   g._icbm_floor_hit = True
+  # icbmcurv2pnw: the record float()s these, so the permissive `__getattr__ -> None` stub cannot
+  # supply them. Defaults chosen as a MEASURED gentle bend (not zeros) so a test that forgets to
+  # override still distinguishes "reached the record" from "read a default".
+  g._icbm_k = 0.004
+  g._icbm_k_dist = 180.0
+  g._icbm_k_v = 25.0
+  g._icbm_k_n = 6
+  g._icbm_k_ahead = True
   g._lc_spd_a = 0.55
   g._car_gps = {"lat": 47.672952, "lon": -122.365067}
   for k, v in over.items():
@@ -105,3 +113,46 @@ class TestCarGpsTelemetry:
     """THE requested behaviour: empty on the Tesla. No Ford carstate means nothing publishes
     CarGps, so the field must log as None rather than {} or a zero coordinate."""
     assert _record(_car_gps=None)["car_gps"] is None
+
+
+class TestIcbmCurvatureTelemetry:
+  """icbmcurv2pnw. The map polyline's own geometry, on the ICBM (stock-ACC) path.
+
+  Why this is pinned at the record level and not only in _read_map: the 2026-09-05/06 phantom
+  slowdowns were invisible precisely because a measurement that DID exist (VTSC's mapK) never
+  reached the ICBM path's records. A measurement that is computed and then dropped on the way to
+  ces_events is worth exactly nothing, and that has now happened three times in this file's history.
+  """
+
+  def test_curvature_fields_reach_the_record(self):
+    rec = _record()
+    assert rec["icbmK"] == pytest.approx(0.004)
+    assert rec["icbmKD"] == pytest.approx(180.0)
+    assert rec["icbmKV"] == pytest.approx(25.0)
+    assert rec["icbmKN"] == 6
+    assert rec["icbmKAhead"] is True
+
+  def test_the_values_are_not_hardcoded(self):
+    """A constant emit would pass the test above; the fields must track the controller's state."""
+    rec = _record(_icbm_k=0.0125, _icbm_k_dist=64.0, _icbm_k_v=14.1, _icbm_k_n=2, _icbm_k_ahead=False)
+    assert rec["icbmK"] == pytest.approx(0.0125)
+    assert rec["icbmKD"] == pytest.approx(64.0)
+    assert rec["icbmKV"] == pytest.approx(14.1)
+    assert rec["icbmKN"] == 2
+    assert rec["icbmKAhead"] is False
+
+  def test_unmeasurable_is_distinguishable_from_straight(self):
+    """THE point of the whole change. Both rows carry icbmK == 0.0; only icbmKN separates them, and
+    a clamp built on `icbmK ~= 0` without reading icbmKN would fire on every unmeasurable tick --
+    i.e. on every Lightning tick today -- and suppress real curves."""
+    unmeasurable = _record(_icbm_k=0.0, _icbm_k_v=0.0, _icbm_k_n=0)
+    straight = _record(_icbm_k=0.0, _icbm_k_v=0.0, _icbm_k_n=9)
+    assert unmeasurable["icbmK"] == straight["icbmK"] == 0.0
+    assert unmeasurable["icbmKN"] == 0
+    assert straight["icbmKN"] == 9
+
+  def test_icbmK_resolution_survives_rounding(self):
+    """A 5 km-radius sweeper is k = 2e-4. Rounding that to the 5 decimals VTSC's mapK uses keeps it,
+    but the next decimal down would not -- and the whole point is telling a small real curvature
+    apart from a true zero, so the field is emitted at 6."""
+    assert _record(_icbm_k=0.000123)["icbmK"] == pytest.approx(0.000123)
