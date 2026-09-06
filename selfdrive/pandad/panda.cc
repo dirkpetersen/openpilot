@@ -109,7 +109,34 @@ void Panda::set_ir_pwr(uint16_t ir_pwr) {
 std::optional<health_t> Panda::get_state() {
   health_t health {0};
   int err = handle->control_read(0xd2, 0, 0, (unsigned char*)&health, sizeof(health));
-  return err >= 0 ? std::make_optional(health) : std::nullopt;
+  if (err < 0) {
+    // comms error -- unchanged handling, the caller retries
+    return std::nullopt;
+  }
+  // madsheartbeat2pnw: health_t is a VERSIONED WIRE STRUCT shared with the panda firmware, and the
+  // panda is flashed separately from this code, so "new openpilot, old panda" WILL happen. Both
+  // transports return the number of bytes the panda actually sent (libusb_control_transfer; the
+  // SPI response header's rx_data_len), and the firmware always answers 0xd2 with sizeof(health_t)
+  // of ITS build. A short read therefore means the flashed firmware predates a field added here,
+  // and `health` keeps the zero-initialised tail -- a FABRICATED value for the new fields.
+  //
+  // Flagged, logged once, and still returned -- the refusal is made in connect(), and ONLY for a
+  // panda this openpilot actually flashes. It must not be made here: the Tesla Raven runs a SECOND,
+  // DEPRECATED panda that pandad.py flashes from a checked-in prebuilt binary (F4), or skips
+  // entirely, so that panda can legitimately run an older health_t forever. Returning nullopt for
+  // it would stop pandaStates and the heartbeat for the WHOLE car -- taking the Raven off the road
+  // over a field only the car's own panda is ever read for. The zeroed tail is the fail-safe value
+  // in both cases ("lateral not permitted", "no disengage reason"), and that panda sits in
+  // SILENT/NO_OUTPUT, which selfdrived's IGNORED_SAFETY_MODES already excludes.
+  // (Fable review 2026-09-05 -- the earlier version returned nullopt here and would have
+  // crash-looped pandad on the Raven.)
+  if (err != (int)sizeof(health)) {
+    if (!health_packet_mismatch.exchange(true)) {
+      LOGE("panda %s health packet size mismatch: panda sent %d bytes, this build expects %d. "
+           "Fields past byte %d are NOT from this panda.", hw_serial().c_str(), err, (int)sizeof(health), err);
+    }
+  }
+  return std::make_optional(health);
 }
 
 std::optional<can_health_t> Panda::get_can_state(uint16_t can_number) {
@@ -156,8 +183,11 @@ void Panda::enable_deepsleep() {
   handle->control_write(0xfb, 0, 0);
 }
 
-void Panda::send_heartbeat(bool engaged) {
-  handle->control_write(0xf3, engaged, 0);
+void Panda::send_heartbeat(bool engaged, bool engaged_mads) {
+  // madsheartbeat2pnw: param2 is the LATERAL half -- "openpilot still intends lateral authority".
+  // board/main.c revokes controls_allowed_lateral after 3 s of it reading 0 while the latch is up.
+  // A panda flashed with a firmware that predates this simply ignores param2.
+  handle->control_write(0xf3, engaged, engaged_mads);
 }
 
 void Panda::set_can_speed_kbps(uint16_t bus, uint16_t speed) {

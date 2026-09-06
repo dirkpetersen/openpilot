@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <ctime>
 #include <functional>
@@ -69,6 +70,11 @@ public:
   void set_fan_speed(uint16_t fan_speed);
   uint16_t get_fan_speed();
   void set_ir_pwr(uint16_t ir_pwr);
+  // madsheartbeat2pnw: set by get_state() when the panda answers 0xd2 with a DIFFERENT number
+  // of bytes than this build's health_t -- i.e. the flashed firmware is not this revision.
+  // Distinct from a comms error, which leaves it false, so a flaky link is never
+  // misdiagnosed as a version mismatch.
+  std::atomic<bool> health_packet_mismatch = false;
   std::optional<health_t> get_state();
   std::optional<can_health_t> get_can_state(uint16_t can_number);
   void set_loopback(bool loopback);
@@ -77,7 +83,7 @@ public:
   std::optional<std::string> get_serial();
   void set_power_saving(bool power_saving);
   void enable_deepsleep();
-  void send_heartbeat(bool engaged);
+  void send_heartbeat(bool engaged, bool engaged_mads);
   void set_can_speed_kbps(uint16_t bus, uint16_t speed);
   void set_can_fd_auto(uint16_t bus, bool enabled);
   void set_data_speed_kbps(uint16_t bus, uint16_t speed);

@@ -146,6 +146,7 @@ class SelfdriveD:
     self.active = False
     self.mismatch_counter = 0
     self.cruise_mismatch_counter = 0
+    self.lateral_mismatch_counter = 0  # madsheartbeat2pnw
     self.last_steering_pressed_frame = 0
     # takecontrol2pnw: edge-triggered "Take Control" (steerSaturated) alert flight-recorder state —
     # see the steerSaturated block in update_events() and its use at the ces_pnw call site in step().
@@ -368,6 +369,15 @@ class SelfdriveD:
       if log.PandaState.FaultType.relayMalfunction in pandaState.faults:
         self.events.add(EventName.relayMalfunction)
 
+    # madsheartbeat2pnw: the LATERAL twin of controlsMismatch above. Raised once the panda has
+    # been reporting "lateral not permitted" for 2 s while MADS was still commanding lateral --
+    # e.g. the panda's own heartbeat_engaged_mads watchdog revoked the latch, or an rx message
+    # went invalid. Without this the failure is SILENT: the panda blocks the tx and the truck
+    # simply stops steering with nothing said. Outside the loop because it is one state, not one
+    # per panda. Unreachable unless MADS is available AND holding lateral alone (see data_sample).
+    if self.lateral_mismatch_counter >= 200:
+      self.events.add(EventName.madsControlsMismatchLateral)
+
     # Handle HW and system malfunctions
     # Order is very intentional here. Be careful when modifying this.
     # All events here should at least have NO_ENTRY and SOFT_DISABLE.
@@ -554,6 +564,19 @@ class SelfdriveD:
     if self.enabled and any(not ps.controlsAllowed for ps in self.sm['pandaStates']
            if ps.safetyModel not in IGNORED_SAFETY_MODES):
       self.mismatch_counter += 1
+
+    # madsheartbeat2pnw: the same check for the PARALLEL lateral authority. It only applies while
+    # MADS holds lateral ALONE -- while openpilot itself is enabled the check above already covers
+    # it, because the panda reports controlsAllowedLateral as
+    # (controls_allowed || controls_allowed_lateral). The `self.enabled` term is not redundant with
+    # `lateral_only`: both are one frame stale here (data_sample runs before mads.update, exactly
+    # as it does before the state machine above), and without it a re-engage could carry a
+    # saturated counter into an enabled frame and immediate-disable a car that is steering fine.
+    if self.enabled or not (self.mads.available and self.mads.lateral_only):
+      self.lateral_mismatch_counter = 0
+    elif any(not ps.controlsAllowedLateral for ps in self.sm['pandaStates']
+             if ps.safetyModel not in IGNORED_SAFETY_MODES):
+      self.lateral_mismatch_counter += 1
 
     return CS
 

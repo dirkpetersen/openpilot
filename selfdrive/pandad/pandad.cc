@@ -78,6 +78,26 @@ Panda *connect(std::string serial="", uint32_t index=0) {
     throw std::runtime_error("Panda firmware out of date. Run pandad.py to update.");
   }
 
+  // madsheartbeat2pnw: refuse a panda whose health_t layout is not this build's -- the flashed
+  // firmware predates a field openpilot now reads, and the missing bytes would be fabricated.
+  //
+  // Gated on `is_supported`, the SAME gate as the firmware-signature check above, so the set of
+  // pandas this can refuse is EXACTLY the set already refusable today. That is the point: the
+  // Tesla Raven's SECOND panda is a deprecated device pandad.py flashes from a checked-in prebuilt
+  // (selfdrive/pandad/fw/panda_f4.bin.signed, NOT rebuilt from panda/) or skips outright, so it can
+  // legitimately run an older health_t. Refusing it would crash-loop pandad and take the Raven off
+  // the road over a Ford-only feature. get_state() logs the mismatch for that panda instead.
+  //
+  // Deliberately NOT retried and NOT thrown on a comms error: health_packet_mismatch is set only by
+  // a SHORT READ, which is definitive (SPI checks the response checksum; USB returns the real
+  // transferred length). A transient failure leaves it false and this is a no-op, so this adds no
+  // new way for a healthy car to refuse to start. (Fable review 2026-09-05.)
+  panda->get_state();
+  if (is_supported && panda->health_packet_mismatch) {
+    throw std::runtime_error("Panda health packet layout mismatch (see the preceding log line). "
+                             "The flashed firmware does not match this openpilot -- reflash the panda.");
+  }
+
   return panda.release();
 }
 
@@ -161,6 +181,12 @@ void fill_panda_state(cereal::PandaState::Builder &ps, cereal::PandaState::Panda
   ps.setSbu1Voltage(health.sbu1_voltage_mV / 1000.0f);
   ps.setSbu2Voltage(health.sbu2_voltage_mV / 1000.0f);
   ps.setSoundOutputLevel(health.sound_output_level_pkt);
+  // madsheartbeat2pnw: the panda's own lateral authority, so selfdrived can detect a revoke
+  // it did not ask for. Equals controlsAllowed on any panda without the MADS safety build.
+  ps.setControlsAllowedLateral((bool)(health.controls_allowed_lateral_pkt));
+  // madsheartbeat2pnw: WHY the panda last took lateral down (opendbc DisengageReason).
+  // Diagnostic only -- nothing reads it for control.
+  ps.setMadsDisengageReason(health.mads_disengage_reason_pkt);
 }
 
 void fill_panda_can_state(cereal::PandaState::PandaCanState::Builder &cs, const can_health_t &can_health) {
@@ -327,7 +353,7 @@ void send_peripheral_state(Panda *panda, PubMaster *pm) {
   pm->send("peripheralState", msg);
 }
 
-void process_panda_state(std::vector<Panda *> &pandas, PubMaster *pm, bool engaged, bool is_onroad, bool spoofing_started) {
+void process_panda_state(std::vector<Panda *> &pandas, PubMaster *pm, bool engaged, bool engaged_mads, bool is_onroad, bool spoofing_started) {
   std::vector<std::string> connected_serials;
   for (Panda *p : pandas) {
     connected_serials.push_back(p->hw_serial());
@@ -364,7 +390,7 @@ void process_panda_state(std::vector<Panda *> &pandas, PubMaster *pm, bool engag
     }
 
     for (const auto &panda : pandas) {
-      panda->send_heartbeat(engaged);
+      panda->send_heartbeat(engaged, engaged_mads);
     }
   }
 }
@@ -443,11 +469,14 @@ void pandad_run(std::vector<Panda *> &pandas) {
 
   Params params;
   RateKeeper rk("pandad", 100);
-  SubMaster sm({"selfdriveState"});
+  // madsheartbeat2pnw: 'madsState' carries the LATERAL half of the heartbeat. It is published by
+  // selfdrived at the same 100 Hz as selfdriveState.
+  SubMaster sm({"selfdriveState", "madsState"});
   PubMaster pm({"can", "pandaStates", "peripheralState"});
   PandaSafety panda_safety(pandas);
   Panda *peripheral_panda = pandas[0];
   bool engaged = false;
+  bool engaged_mads = false;  // madsheartbeat2pnw
   bool is_onroad = false;
 
   // Main loop: receive CAN data and process states
@@ -463,8 +492,17 @@ void pandad_run(std::vector<Panda *> &pandas) {
     if (rk.frame() % 10 == 0) {
       sm.update(0);
       engaged = sm.allAliveAndValid({"selfdriveState"}) && sm["selfdriveState"].getSelfdriveState().getEnabled();
+      // madsheartbeat2pnw: "openpilot still intends lateral authority", the mirror of the panda's
+      // controls_allowed_lateral latch (madsState.enabled, not .active -- .active additionally goes
+      // false in preEnabled/softDisabling, where the latch legitimately stays up). REVOKE-BIASED:
+      // every failure mode -- madsState missing, stale, invalid, or simply not available because
+      // MADS is off -- sends 0, and 0 makes the panda take lateral back after 3 s. It can never
+      // grant authority openpilot did not ask for.
+      engaged_mads = sm.allAliveAndValid({"madsState"}) &&
+                     sm["madsState"].getMadsState().getAvailable() &&
+                     sm["madsState"].getMadsState().getEnabled();
       is_onroad = params.getBool("IsOnroad");
-      process_panda_state(pandas, &pm, engaged, is_onroad, spoofing_started);
+      process_panda_state(pandas, &pm, engaged, engaged_mads, is_onroad, spoofing_started);
       panda_safety.configureSafetyMode(is_onroad);
     }
 
