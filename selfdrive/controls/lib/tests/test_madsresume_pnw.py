@@ -645,3 +645,23 @@ class TestOneToggleGoverns:
     keys = (root / "common/params_keys.h").read_text()
     assert '"MadsAutoResume"' not in keys, "stale key would still be settable"
     assert '"DisengageOnBrake"' in keys, "the one remaining control must stay"
+
+    # Gemini 2026-09-06: checking params_keys.h alone is not enough -- ANY surviving reader
+    # anywhere would raise UnknownKeyName and crash-loop that process onroad. Scan the tree.
+    offenders = []
+    for pat in ("**/*.py", "**/*.cc", "**/*.h", "**/*.sh"):
+      for f in root.glob(pat):
+        if any(x in f.parts for x in (".git", ".venv", "site-packages", "third_party", "tests", "docs")):
+          continue
+        try:
+          text = f.read_text(errors="ignore")
+        except OSError:
+          continue
+        for i, line in enumerate(text.splitlines(), 1):
+          if "MadsAutoResume" not in line:
+            continue
+          st = line.strip()
+          if st.startswith(("#", "//")):
+            continue          # a comment recording why it went is fine
+          offenders.append(f"{f.relative_to(root)}:{i}: {st}")
+    assert not offenders, "live MadsAutoResume reader(s) survived:\n" + "\n".join(offenders)

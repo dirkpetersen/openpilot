@@ -236,7 +236,7 @@ class MadsResumeBrain:
     self._verify_set: float | None = None
     # Edge detector. THREE-STATE: None = "never observed", which is NOT the same fact as
     # "observed False" (Gemini review 2026-09-06). With a plain False, the first tick after the
-    # brain becomes active -- a selfdrived restart mid-drive, or the driver flipping MadsAutoResume
+    # brain becomes active -- e.g. a selfdrived restart mid-drive
     # on while already steering-only -- reads as a rising edge and ARMS without any brake
     # transition having been observed at all: precisely outside the bounded state. The first
     # observation now only SEEDS the detector; arming needs a genuine False->True after that.
