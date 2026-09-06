@@ -86,6 +86,51 @@ LATERAL_DISABLE_TYPES = (ET.USER_DISABLE, ET.IMMEDIATE_DISABLE, ET.SOFT_DISABLE)
 # Nothing else is tolerated. An event this fork has not classified is blocking by default.
 MADS_TOLERATED_EVENTS = (EventName.pedalPressed, EventName.pcmDisable)
 
+# madsbrakerace2pnw: how long the falling edge waits for `brakePressed` to show up.
+#
+# MEASURED ON THE TRUCK 2026-09-06, which is why this exists at all. Captured at the disengage:
+#     t=286.143  en=1 brk=0 regen=0 cruise=1->0
+#     t=286.145  en=0 brk=0 regen=0 cruise=0      <- falling edge, braking STILL False
+# On the Lightning the stock-ACC PCM reacts to the pedal and drops cruiseState.enabled FASTER than
+# `brakePressed` propagates on CAN, so selfdrived disengages on pcmDisable one or more frames BEFORE
+# the brake signal arrives. Judging `braking` on the single falling-edge frame therefore misses the
+# brake every time and MADS never armed -- the feature simply did not work on this car.
+#
+# 0.45 s at 100 Hz. Long enough to cover the observed lead (~2 ms here, but CAN scheduling and a
+# gentle pedal press make it variable); short enough that it cannot bridge two unrelated driver
+# actions. The window only ever ARMS on a real brake: it requires `braking` to actually become true,
+# so a CANCEL-button disengage (no brake) simply lets it expire, and any non-tolerated event in the
+# window kills it outright.
+# STRICTLY NARROWER THAN THE PANDA'S WINDOW. The panda re-latches within MADS_BRAKE_RELATCH_US
+# (300 ms, opendbc/safety/pnw/mads_declarations.h); openpilot waits 250 ms. The ordering is the
+# whole invariant: if openpilot's window were the WIDER one it could arm lateral after the panda had
+# stopped accepting it, and the truck would sit in "UI says lateral-only, panda blocks every steering
+# frame" for the 2.0 s it takes madsControlsMismatchLateral to fire -- worse than a clean disengage.
+# That is exactly what the first version of this fix did (Fable review 2026-09-06, BLOCK).
+# 45 frames = 450 ms nominal, comfortably inside the panda's 600 ms.
+# Sized from the MEASURED lead (321/361 ms in the driver's own logs), not from bus cadence --
+# the delay is pedal travel, not CAN transport. 150 ms would have missed every real press.
+#
+# CORRECTED (Fable review 2026-09-06): the earlier rationale here -- "under CPU contention 25 frames
+# could take >300 ms of wall time" -- had the clock backwards. The relevant frame of reference is CAN
+# time, not wall time: carState frames are produced from CAN traffic, so a stalled card or selfdrived
+# either CONFLATES frames (fewer of them) or bursts them in order. Frame counting can therefore only
+# UNDER-measure the CAN-time distance between the cruise-drop frame and the brake frame, never
+# over-measure it, and the invariant was already robust to scheduling. 15 is kept anyway: it costs
+# nothing, and margin against a shared invariant is cheap insurance.
+#
+# The error is deliberately ASYMMETRIC, which is why erring short is right:
+#   * openpilot window TOO SHORT -> openpilot does not arm, the panda may re-latch, nothing is
+#     commanded. The feature just misses that press. Harmless.
+#   * openpilot window TOO LONG  -> openpilot shows lateral-only while the panda blocks every
+#     steering frame, for the 2.0 s until madsControlsMismatchLateral. Actively bad.
+# 150 ms still covers the measured case: the brake lands on the next 10 Hz frame, ~100 ms later.
+#
+# The fully robust form is to stop racing the panda at all -- gate arming on
+# pandaState.controlsAllowedLateral so the two agree by construction. That needs selfdrived to pass
+# the panda's view into update() (mads_pnw itself must stay pure), and is the right follow-up.
+MADS_BRAKE_GRACE_FRAMES = 45
+
 
 def has_blocking_event(events: Events) -> bool:
   """True if this frame carries any disabling event other than the brake press itself."""
@@ -125,6 +170,8 @@ class MadsPnw:
 
     self._op_enabled_prev = False
     self._cruise_enabled_prev = False
+    # madsbrakerace2pnw: frames left in which a late `brakePressed` may still arm lateral-only.
+    self._brake_grace = 0
 
   def update(self, op_enabled: bool, op_active: bool, braking: bool, cruise_enabled: bool,
              events: Events) -> None:
@@ -152,6 +199,7 @@ class MadsPnw:
       # Inert. Hold every output at False so `madsState` can never be mistaken for authority,
       # and keep the edge detector fed so enabling mid-session could never see a stale edge.
       self._op_enabled_prev = op_enabled
+      self._brake_grace = 0
       self.enabled = False
       self.active = False
       self.lateral_only = False
@@ -163,13 +211,20 @@ class MadsPnw:
       # openpilot itself holds authority; MADS adds nothing and simply mirrors it. The panda has
       # controls_allowed here, so the (controls_allowed || controls_allowed_lateral) tx gates are
       # satisfied either way.
+      self._brake_grace = 0
       self.enabled = True
       self.active = op_active
       self.lateral_only = False
     elif self._op_enabled_prev:
       # THE falling edge. Lateral survives only a brake press, only when the driver asked for it,
       # and only when nothing else in the frame wants openpilot off.
-      self.enabled = (not self.disengage_on_brake) and braking and not blocked
+      may_arm = (not self.disengage_on_brake) and not blocked
+      self.enabled = may_arm and braking
+      # madsbrakerace2pnw: the brake can still be IN FLIGHT on this frame (see
+      # MADS_BRAKE_GRACE_FRAMES -- measured on the truck, the PCM drops cruise first). Open a
+      # bounded window instead of deciding on one frame's view. Nothing is armed here; the window
+      # only lets a LATER frame arm, and only on a real `braking` edge.
+      self._brake_grace = 0 if (self.enabled or not may_arm) else MADS_BRAKE_GRACE_FRAMES
       self.active = self.enabled
       self.lateral_only = self.enabled
     else:
@@ -182,6 +237,14 @@ class MadsPnw:
       # the feature on the very frame it arms.
       if blocked or cruise_engage_edge:
         self.enabled = False
+        self._brake_grace = 0            # a blocked frame ends the pending window outright
+      elif self._brake_grace > 0:
+        # madsbrakerace2pnw: still waiting for the brake the PCM already reacted to. Arm the moment
+        # it lands; otherwise let the window run out and stay off. `not self.enabled` keeps this to
+        # the arming path only -- it can never re-arm authority that a later frame took away.
+        self._brake_grace -= 1
+        if braking and not self.enabled:
+          self.enabled = True
       self.active = self.enabled
       self.lateral_only = self.enabled
 
