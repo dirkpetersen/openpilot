@@ -789,3 +789,95 @@ class TestNoDisengageOnBrakeIsGone:
     assert "brake_disengage = (CS.brakePressed" in src
     assert "or brake_disengage:" in src
     assert "brake_disengage = False" not in src, "an unconditional suppression must not exist"
+
+
+class TestBrakeArrivesLate:
+  """madsbrakerace2pnw: the falling edge must tolerate a brake that has not landed yet.
+
+  Captured on the truck 2026-09-06 -- the driver pressed the brake and EVERYTHING disengaged:
+      t=286.143  en=1 brk=0 regen=0 cruise=1->0
+      t=286.145  en=0 brk=0 regen=0 cruise=0     <- falling edge, braking STILL False
+  The Lightning's stock-ACC PCM drops cruiseState.enabled faster than brakePressed propagates on
+  CAN, so the one-frame test at the falling edge missed the brake every time.
+  """
+
+  @staticmethod
+  def _mads():
+    from openpilot.selfdrive.selfdrived.mads_pnw import MadsPnw
+    return MadsPnw(MADS_ON)
+
+  @staticmethod
+  def _ev(*names):
+    from openpilot.selfdrive.selfdrived.events import Events
+    e = Events()
+    for n in names:
+      e.add(n)
+    return e
+
+  def _no_ev(self):
+    from openpilot.selfdrive.selfdrived.events import Events
+    return Events()
+
+  def test_late_brake_still_arms_lateral(self):
+    """THE REGRESSION: cruise drops first, brake lands 3 frames later -> lateral must survive."""
+    from openpilot.selfdrive.selfdrived.events import EventName
+    m = self._mads()
+    m.update(True, True, False, True, self._no_ev())                       # engaged
+    m.update(False, False, False, False, self._ev(EventName.pcmDisable))   # falling edge, NO brake
+    assert not m.enabled, "must not arm before the brake actually arrives"
+    for _ in range(3):
+      m.update(False, False, False, False, self._ev(EventName.pcmDisable))
+    m.update(False, False, True, False, self._ev(EventName.pcmDisable))    # brake lands
+    assert m.enabled and m.lateral_only, "late brake must arm lateral-only"
+
+  def test_cancel_button_without_brake_never_arms(self):
+    """A cancel-button disengage has no brake: the window must expire and stay off."""
+    from openpilot.selfdrive.selfdrived.mads_pnw import MADS_BRAKE_GRACE_FRAMES
+    from openpilot.selfdrive.selfdrived.events import EventName
+    m = self._mads()
+    m.update(True, True, False, True, self._no_ev())
+    m.update(False, False, False, False, self._ev(EventName.pcmDisable))
+    for _ in range(MADS_BRAKE_GRACE_FRAMES + 5):
+      m.update(False, False, False, False, self._ev(EventName.pcmDisable))
+      assert not m.enabled, "no brake ever pressed -- must never arm"
+
+  def test_brake_after_window_expires_does_not_arm(self):
+    """The window is BOUNDED: a brake long after the disengage is a new action, not this one."""
+    from openpilot.selfdrive.selfdrived.mads_pnw import MADS_BRAKE_GRACE_FRAMES
+    from openpilot.selfdrive.selfdrived.events import EventName
+    m = self._mads()
+    m.update(True, True, False, True, self._no_ev())
+    m.update(False, False, False, False, self._ev(EventName.pcmDisable))
+    for _ in range(MADS_BRAKE_GRACE_FRAMES + 2):
+      m.update(False, False, False, False, self._ev(EventName.pcmDisable))
+    m.update(False, False, True, False, self._ev(EventName.pcmDisable))
+    assert not m.enabled, "brake after the window must not resurrect lateral"
+
+  def test_blocking_event_in_window_kills_it(self):
+    """A real fault during the wait must end it, brake or no brake."""
+    from openpilot.selfdrive.selfdrived.events import EventName
+    m = self._mads()
+    m.update(True, True, False, True, self._no_ev())
+    m.update(False, False, False, False, self._ev(EventName.pcmDisable))
+    m.update(False, False, False, False, self._ev(EventName.wrongGear))
+    m.update(False, False, True, False, self._ev(EventName.pcmDisable))
+    assert not m.enabled, "a blocking event must void the pending window"
+
+  def test_disengage_on_brake_on_still_never_arms(self):
+    """With the toggle ON (stock), the window must not exist at all."""
+    from openpilot.selfdrive.selfdrived.mads_pnw import MadsPnw
+    from openpilot.selfdrive.selfdrived.events import EventName
+    m = MadsPnw(MADS_DISENGAGE)
+    m.update(True, True, False, True, self._no_ev())
+    m.update(False, False, False, False, self._ev(EventName.pcmDisable))
+    for _ in range(5):
+      m.update(False, False, True, False, self._ev(EventName.pcmDisable))
+      assert not m.enabled, "DisengageOnBrake=ON must keep stock behaviour"
+
+  def test_prompt_brake_still_arms_immediately(self):
+    """The original path must be untouched: brake present on the falling edge arms at once."""
+    from openpilot.selfdrive.selfdrived.events import EventName
+    m = self._mads()
+    m.update(True, True, False, True, self._no_ev())
+    m.update(False, False, True, False, self._ev(EventName.pedalPressed))
+    assert m.enabled and m.lateral_only
