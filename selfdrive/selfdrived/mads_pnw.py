@@ -96,7 +96,7 @@ MADS_TOLERATED_EVENTS = (EventName.pedalPressed, EventName.pcmDisable)
 # the brake signal arrives. Judging `braking` on the single falling-edge frame therefore misses the
 # brake every time and MADS never armed -- the feature simply did not work on this car.
 #
-# 0.25 s at 100 Hz. Long enough to cover the observed lead (~2 ms here, but CAN scheduling and a
+# 0.45 s at 100 Hz. Long enough to cover the observed lead (~2 ms here, but CAN scheduling and a
 # gentle pedal press make it variable); short enough that it cannot bridge two unrelated driver
 # actions. The window only ever ARMS on a real brake: it requires `braking` to actually become true,
 # so a CANCEL-button disengage (no brake) simply lets it expire, and any non-tolerated event in the
@@ -107,7 +107,29 @@ MADS_TOLERATED_EVENTS = (EventName.pedalPressed, EventName.pcmDisable)
 # stopped accepting it, and the truck would sit in "UI says lateral-only, panda blocks every steering
 # frame" for the 2.0 s it takes madsControlsMismatchLateral to fire -- worse than a clean disengage.
 # That is exactly what the first version of this fix did (Fable review 2026-09-06, BLOCK).
-MADS_BRAKE_GRACE_FRAMES = 25
+# 45 frames = 450 ms nominal, comfortably inside the panda's 600 ms.
+# Sized from the MEASURED lead (321/361 ms in the driver's own logs), not from bus cadence --
+# the delay is pedal travel, not CAN transport. 150 ms would have missed every real press.
+#
+# CORRECTED (Fable review 2026-09-06): the earlier rationale here -- "under CPU contention 25 frames
+# could take >300 ms of wall time" -- had the clock backwards. The relevant frame of reference is CAN
+# time, not wall time: carState frames are produced from CAN traffic, so a stalled card or selfdrived
+# either CONFLATES frames (fewer of them) or bursts them in order. Frame counting can therefore only
+# UNDER-measure the CAN-time distance between the cruise-drop frame and the brake frame, never
+# over-measure it, and the invariant was already robust to scheduling. 15 is kept anyway: it costs
+# nothing, and margin against a shared invariant is cheap insurance.
+#
+# The error is deliberately ASYMMETRIC, which is why erring short is right:
+#   * openpilot window TOO SHORT -> openpilot does not arm, the panda may re-latch, nothing is
+#     commanded. The feature just misses that press. Harmless.
+#   * openpilot window TOO LONG  -> openpilot shows lateral-only while the panda blocks every
+#     steering frame, for the 2.0 s until madsControlsMismatchLateral. Actively bad.
+# 150 ms still covers the measured case: the brake lands on the next 10 Hz frame, ~100 ms later.
+#
+# The fully robust form is to stop racing the panda at all -- gate arming on
+# pandaState.controlsAllowedLateral so the two agree by construction. That needs selfdrived to pass
+# the panda's view into update() (mads_pnw itself must stay pure), and is the right follow-up.
+MADS_BRAKE_GRACE_FRAMES = 45
 
 
 def has_blocking_event(events: Events) -> bool:
