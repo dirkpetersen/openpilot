@@ -219,6 +219,96 @@ Two more things worth knowing before you schedule it:
   fetches regardless — so ~976 MB can land on LTE. If the truck will be away from WiFi, pause updates
   or make sure it fetches on WiFi first.
 
+### The boot-path `python3` is the VENV python — `agnos.py --verify` is NOT broken
+
+`agnos.py:13` has a top-level `import openpilot.system.updated.casync.casync`, and `casync.py:15`
+does `from Crypto.Hash import SHA512`. `Crypto` (pycryptodome 3.23.0) exists **only** in
+`/usr/local/venv/lib/python3.12/site-packages` — it is deliberately *not* in the agnos19-compat
+overlay. That reads like `agnos_init`'s `agnos.py --verify` can never run, so the clean swap at
+`launch_chffrplus.sh:29` can never fire and every AGNOS bump falls through to the tap-gated
+`updater`. **That is wrong**, and it is an easy thing to "reproduce" incorrectly. Checked
+end-to-end on the own-car 3X on 2026-09-05:
+
+- `launch_chffrplus.sh:29` runs `$AGNOS_PY` **directly**, so its shebang `#!/usr/bin/env python3`
+  resolves `python3` through **PATH** — it never names an interpreter.
+- `comma.service` → `/usr/comma/comma.sh` → `source /etc/profile` → `/etc/profile:40`
+  `source /usr/local/venv/bin/activate`. `/etc/profile:43` then prepends `/usr/comma/shims`, which
+  contains only `pip`, `pip3`, `uv` — **no `python3`**, so it cannot re-point the interpreter.
+- Measured from the **live running `manager.py`**'s `/proc/<pid>/environ` (the real boot env, and the
+  same shell environment `agnos_init` runs in):
+  ```
+  VIRTUAL_ENV=/usr/local/venv
+  PYTHONPATH=/data/openpilot:/data/pnw/agnos19-compat/site-packages
+  PATH=/usr/comma/shims:/usr/local/venv/bin:/usr/local/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+  ```
+  `/usr/local/venv/bin` precedes `/usr/bin`, so `env python3` **is** the venv python and `Crypto`
+  resolves normally.
+- `agnos_init` is called at `launch_chffrplus.sh:137` — inside `launch`, **after** the overlay
+  `PYTHONPATH` export. The overlay is genuinely required for this import chain (without it it dies
+  on `import serial`, `system/hardware/tici/lpa.py:7`), and it is already on the path by then.
+
+**Reproducing it correctly.** Use a login shell (so `/etc/profile` runs) and let the shebang choose
+the interpreter. Do **not** hardcode `/usr/bin/python3`: that interpreter sees neither the venv nor
+`Crypto`, and yields a `ModuleNotFoundError: No module named 'Crypto'` that does not occur at boot.
+
+```bash
+ssh comma@$COMMA_IP 'bash -lc "cd /data/openpilot && \
+  export PYTHONPATH=/data/openpilot:/data/pnw/agnos19-compat/site-packages && \
+  ./system/hardware/tici/agnos.py --help"'        # exit 0 -> the casync/Crypto import is fine
+```
+
+**⚠️ `--verify` is NOT read-only, so never use it as a probe.** On success `agnos.py`'s `__main__`
+calls `swap()`, which `clear_partition_hash()`es the target slot (a write to the partition) and then
+runs `abctl --set_active` — see the rollback section below. To test verification *without* swapping,
+call the predicate the CLI branches on:
+
+```bash
+ssh comma@$COMMA_IP bash -l <<'EOF'
+cd /data/openpilot
+export PYTHONPATH=/data/openpilot:/data/pnw/agnos19-compat/site-packages
+python3 -c 'from openpilot.system.hardware.tici.agnos import get_target_slot_number as g, verify_agnos_update as v
+s = g(); print("target slot", s, "verifies:", v("system/hardware/tici/agnos.json", s))'
+EOF
+```
+
+(Note whose manifest you point it at. On 2026-09-05 the device's own tree was still at `d54a88e`
+with `AGNOS_VERSION="19.6"`, so `/data/openpilot/system/hardware/tici/agnos.json` is the **19.6**
+manifest and the snippet above prints `False` — correctly, since `_b` holds 19.7 images. Point it at
+the 19.7 manifest from `3devpnw` (`c96e18f9d2`) to see the real answer.)
+
+Result on 2026-09-05 (device on 19.6/`_a`, 19.7 already flashed to `_b` by `updated.py`'s background
+`flash_agnos_update()`): **all seven partitions of the 19.7 manifest verify `True` against slot `_b`**
+— i.e. `--verify` would exit 0 and `launch_chffrplus.sh:29`'s `sudo reboot` would take the clean
+one-fast-reboot swap. As a negative control, the same unmodified CLI pointed at the AGNOS **17.2**
+manifest runs with no traceback and correctly exits 1 (all seven partitions `False`). Nothing needs
+to be added to the overlay for this path.
+
+**And do not "fix" it anyway** — putting `pycryptodome` in the overlay would be actively harmful, not
+merely wasteful. `PYTHONPATH` precedes the venv's `site-packages`, so an overlay `Crypto` would
+**shadow the image-baked pycryptodome 3.23.0 for every openpilot process** (uploader, `updated`,
+casync) — a system-wide swap to fix a non-bug. Putting the venv itself on the boot `PYTHONPATH` is
+worse still: it inverts the shadowing this whole overlay exists to create (see the top of this doc).
+Note also that `pycryptodome` alone would not even have been sufficient: `/usr/bin/python3` cannot
+import `agnos.py` without `zmq`, `numpy`, `capnp` and `zstandard` either — ~100 MB in total, all of
+it already present in the venv the boot path actually uses.
+
+Two loose ends this pass surfaced, flagged but **not** fixed here:
+
+- **`agnos19-compat/overlay.tar.zst` is NOT git-LFS**, despite what `launch_chffrplus.sh:92`'s
+  comment ("bundled in the repo via git-LFS") says. `git check-attr filter` returns `unspecified` and the
+  committed blob is 68,937,948 raw bytes starting with the zstd magic `28 b5 2f fd` — a plain git
+  object. Every byte added to it is permanent clone weight for everyone, with no LFS lazy-fetch.
+- The PATH reasoning above is read off **19.6's** `/etc/profile`. The 19.7 audit in this doc compared
+  `/usr/comma/*` and the venv, not `/etc/profile`. If a future AGNOS stops activating the venv there,
+  this analysis needs re-running — that, not `Crypto`, is the thing that would actually break the
+  swap path.
+
+**Residual, stated honestly:** everything above proves the *verification* half. The `swap()` half —
+`abctl --set_active` as user `comma`, plus its `while True` retry loop with no sleep or bail-out
+(`agnos.py:266-272`) — has never been exercised on this device under 19.6. It is unmodified upstream
+code that stock devices run on every AGNOS bump, and `comma` is in `disk`/`sudo`, so it is expected
+to work; but the first real execution will be the 19.7 boot.
+
 ### If it goes wrong: rolling back off 19.7
 
 **What actually happens if you just switch slots (verified by reading `agnos.py`, not assumed).**
@@ -295,6 +385,9 @@ URLs live on in `git log -p -- system/hardware/tici/agnos.json`.
   the pin alone would make a friend's device (on 17.2) *upgrade*-flash to 19.6 (via `agnos_init` or
   `updated.py`'s background flash) and then hang exactly like this one, with no overlay staged. Hold
   until the overlay staging is automated (or done per-device) before this reaches `3testpnw`.
+- **`Crypto` / `agnos.py --verify` is a false alarm.** The AGNOS swap path works; it runs under the
+  venv python via PATH. See "The boot-path `python3` is the VENV python" above before adding anything
+  to the overlay for it. Verified 2026-09-05.
 - This is a **compat bridge**, not the endgame. The clean 19.6 answer is a real forward-port of the
   `*2pnw` features onto the 0.11.2 (`xnor-sync-master`) base.
 - Inactive A/B slot may hold a part-written 17.2 image from the pre-pin flash attempts; `abctl
