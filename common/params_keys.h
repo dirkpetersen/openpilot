@@ -130,6 +130,17 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // TogglesInvertedMigrated) so upgrading never flips anyone's live behavior.
     {"NudgeForLaneChange", {PERSISTENT, BOOL, "0"}},
     {"NoDisengageOnBrake", {PERSISTENT, BOOL, "0"}},   // auto2pnw: stay engaged through brake (unsupported here; toggle greyed)
+    // mads2pnw: INVERTED-POLARITY toggle, same idiom as DisableLaneCentering / NoFordAngleSteering.
+    // Ships "0" (satisfying the default-OFF rule) and "0" is ALSO the new behaviour: OFF = openpilot
+    // does NOT disengage lateral on brake (steering survives the brake press, MADS REMAIN_ACTIVE);
+    // ON = stock behaviour (MADS DISENGAGE). The default is deliberate, not a slip.
+    {"DisengageOnBrake", {PERSISTENT, BOOL, "0"}},
+    // mads2pnw: does the PANDA CURRENTLY FLASHED actually carry the MADS controls_allowed_lateral
+    // safety build? There is no honest runtime probe for this (see docs/pnw/MADS2PNW.md), so it is
+    // an explicit, conservative, default-OFF declaration that the FLASH PROCEDURE tells the owner
+    // to set. While it is 0, card.py sends alternativeExperience=0 (stock panda behaviour) and the
+    // UI greys "Disengage on brake" forced to ON/stock. NEVER infer this from a fingerprint.
+    {"PandaMadsSafety", {PERSISTENT, BOOL, "0"}},
     // lanecenter2pnw: small bounded curvature trim toward lane-line center. Deliberately an OPT-OUT
     // (default "0" = NOT disabled = feature ON), the one exception to this fork's "new toggles
     // default OFF" rule — see selfdrive/controls/lib/lane_centering.py + toggles.py for why (the

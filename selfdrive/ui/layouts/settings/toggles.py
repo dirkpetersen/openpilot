@@ -125,6 +125,17 @@ DESCRIPTIONS = {
     "openpilot will resume controlling speed as soon as you release the brake. " +
     "Not currently supported on any car here (Ford or Tesla) — this toggle is disabled."
   ),
+  # mads2pnw: INVERTED-POLARITY toggle (same idiom as DisableLaneCentering / NoFordAngleSteering).
+  # OFF (the shipping default) = steering survives the brake. ON = stock. It is the working
+  # replacement for the (greyed, never-supported) NoDisengageOnBrake toggle above.
+  "DisengageOnBrake": tr_noop(
+    "When you press the brake pedal, also stop STEERING. This is ON in stock openpilot. " +
+    "Turn it OFF and openpilot keeps steering through a brake press -- braking still hands the " +
+    "speed straight back to you, it just no longer takes the steering away too. On the F-150 " +
+    "Lightning the truck's own adaptive cruise does the speed and openpilot only steers, so a " +
+    "brake tap otherwise takes away everything. Ford F-150 Lightning only, and only with a panda " +
+    "flashed with the matching lateral-safety firmware -- without it this is locked ON."
+  ),
   # lanecenter2pnw: Lane Centering is ON by default; this is the opt-OUT toggle. Tuning lives in a
   # hot-reloaded file, not the UI, so the description points there rather than to sliders.
   "DisableLaneCentering": tr_noop(
@@ -216,6 +227,16 @@ class TogglesLayout(Widget):
         DESCRIPTIONS["NoDisengageOnBrake"],
         "disengage_on_accelerator.png",
         False,
+      ),
+      # mads2pnw: INVERTED — OFF (default) = steering survives the brake, ON = stock. needs_restart
+      # is True because the panda only latches the MADS alternative_experience bits at safety-mode
+      # init: without the onroad cycle _toggle_callback requests, flipping this would silently do
+      # nothing until the next reboot.
+      "DisengageOnBrake": (
+        lambda: tr("Disengage on brake"),
+        DESCRIPTIONS["DisengageOnBrake"],
+        "disengage_on_accelerator.png",
+        True,
       ),
       # lanecenter2pnw: opt-OUT toggle for a feature that ships ON by default (param default "0" =
       # not disabled). Same idiom as every other bool toggle here (toggle_item, no restart needed —
@@ -531,6 +552,23 @@ class TogglesLayout(Widget):
     if "NoDisengageOnBrake" in self._toggles:
       self._toggles["NoDisengageOnBrake"].action_item.set_enabled(False)
       self._toggles["NoDisengageOnBrake"].action_item.set_state(False)
+
+    # mads2pnw: "Disengage on brake" is INVERTED — OFF means "keep steering through the brake".
+    # It is only operable when BOTH:
+    #   * this car has the mads_lateral capability (PnwVehicle; today the Lightning), and
+    #   * PandaMadsSafety says the panda CURRENTLY FLASHED carries controls_allowed_lateral.
+    # The panda gate is the safety-critical half. With a stock panda, "OFF" would be the exact
+    # half-state the (permanently greyed) NoDisengageOnBrake toggle above exists to prevent, so
+    # grey it and paint it ON (stock). DISPLAY ONLY — deliberately no put_bool, for the same
+    # shared-device reason spelled out under the angle-steering clamp below: this is ONE physical
+    # device moved between the Tesla and the Lightning, and persisting a clamp would silently
+    # change the driver's Lightning setting. The REAL forcing lives in card.py, which sends
+    # alternativeExperience=0 whenever either condition fails.
+    if "DisengageOnBrake" in self._toggles:
+      mads_ok = veh.mads_lateral and self._params.get_bool("PandaMadsSafety")
+      self._toggles["DisengageOnBrake"].action_item.set_enabled(mads_ok)
+      if not mads_ok:
+        self._toggles["DisengageOnBrake"].action_item.set_state(True)  # stock: disengage on brake
 
     # angleenable / toggles-invert2pnw: Ford angle-primary lateral is only meaningful on the F-150
     # Lightning (the only car with the matching flashed 4-signal/angle-mode panda safety — capability

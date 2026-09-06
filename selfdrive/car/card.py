@@ -12,6 +12,7 @@ from openpilot.common.realtime import config_realtime_process, Priority, Ratekee
 from openpilot.common.swaglog import cloudlog, ForwardingHandler
 
 from opendbc.car import DT_CTRL, structs
+from opendbc.safety import ALTERNATIVE_EXPERIENCE
 from opendbc.car.can_definitions import CanData, CanRecvCallable, CanSendCallable
 from opendbc.car.carlog import carlog
 from opendbc.car.fw_versions import ObdCallback
@@ -151,7 +152,14 @@ class Car:
       self.CI, self.CP = CI, CI.CP
       self.RI = RI
 
-    self.CP.alternativeExperience = 0
+    # mads2pnw: alternativeExperience was hardcoded to 0 here, which meant NO alternative-experience
+    # bit could ever reach the panda. It is now computed once, at car-init, from the capability view
+    # + the driver toggle. IMPORTANT: pandad pushes this value to the panda (USB 0xdf) and the panda
+    # latches the MADS bits into its state machine only when the safety mode is (re)set, so the
+    # toggle is BOOT-TIME, not live -- flipping it mid-drive changes nothing until the next reboot.
+    # selfdrived cross-checks pandaState.alternativeExperience against this value and raises
+    # controlsMismatch if they ever disagree.
+    self.CP.alternativeExperience = self._alternative_experience()
     openpilot_enabled_toggle = self.params.get_bool("OpenpilotEnabledToggle")
     controller_available = self.CI.CC is not None and openpilot_enabled_toggle and not self.CP.dashcamOnly
     self.CP.passive = not controller_available or self.CP.dashcamOnly
@@ -228,6 +236,43 @@ class Car:
 
     # card is driven by can recv, expected at 100Hz
     self.rk = Ratekeeper(100, print_delay_threshold=None)
+
+
+  def _alternative_experience(self) -> int:
+    """mads2pnw: the alternative_experience bitfield handed to the panda.
+
+    Starts at 0 (upstream behaviour, and what this returned before mads2pnw -- it was hardcoded).
+    The only bits this fork ever sets are the MADS ones, and they require ALL of:
+
+      * PnwVehicle says this car has the mads_lateral capability (today: the F-150 Lightning --
+        it runs stock ACC, so steering is all openpilot does for it and a brake tap takes away
+        everything). Capability view, never a fingerprint test in feature code; the Raven is
+        excluded and can never receive these bits.
+      * PandaMadsSafety says the panda CURRENTLY FLASHED carries the controls_allowed_lateral
+        safety build. Default OFF, set by hand as part of the flash procedure -- there is no
+        honest runtime probe (docs/pnw/MADS2PNW.md explains why). Without it we send 0, i.e. the
+        stock panda contract, so a stock panda and openpilot never disagree.
+
+    Polarity, deliberately inverted (same idiom as DisableLaneCentering / NoFordAngleSteering):
+      DisengageOnBrake OFF (the shipping default) -> REMAIN_ACTIVE: neither policy bit is set, so
+        the panda keeps controls_allowed_lateral latched through a brake press while still
+        clearing controls_allowed. This is the behaviour the owner asked for.
+      DisengageOnBrake ON -> DISENGAGE: the panda drops lateral on the brake rising edge, i.e.
+        stock behaviour.
+    PAUSE exists in the safety code and is deliberately NOT exposed.
+    """
+    alt_exp = ALTERNATIVE_EXPERIENCE.DEFAULT
+
+    if not PnwVehicle(self.CP).mads_lateral:
+      return alt_exp
+    if not self.params.get_bool("PandaMadsSafety"):
+      return alt_exp
+
+    alt_exp |= ALTERNATIVE_EXPERIENCE.ENABLE_MADS
+    if self.params.get_bool("DisengageOnBrake"):
+      alt_exp |= ALTERNATIVE_EXPERIENCE.MADS_DISENGAGE_LATERAL_ON_BRAKE
+
+    return alt_exp
 
   def _maybe_reset_calibration_on_car_change(self) -> None:
     """calswap2pnw: if this real fingerprint differs from the car the current calibration belongs to,
