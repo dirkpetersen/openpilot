@@ -57,6 +57,7 @@ class UIState:
         "liveParameters",
         "rawAudioData",
         "mapdOut",  # mapd2pnw: official mapd OSM speed limits + road name for the on-road display/warning
+        "madsState",  # madsop2pnw: MADS is holding lateral alone -- must not paint "disengaged"
       ]
     )
 
@@ -164,7 +165,14 @@ class UIState:
       ss = self.sm["selfdriveState"]
       state = ss.state
 
-      if state in (log.SelfdriveState.OpenpilotState.preEnabled, log.SelfdriveState.OpenpilotState.overriding):
+      # madsop2pnw: openpilot's own engagement is gone but MADS is still steering. Paint the
+      # OVERRIDE (grey) state, never DISENGAGED -- a car that is steering itself must never show a
+      # UI that says openpilot is off. Guarded on `available` so this is dead code on every car
+      # without the flashed MADS panda, and falls through to the stock branch below.
+      mads = self.sm["madsState"]
+      if mads.available and mads.lateralOnly:
+        self.status = UIStatus.OVERRIDE
+      elif state in (log.SelfdriveState.OpenpilotState.preEnabled, log.SelfdriveState.OpenpilotState.overriding):
         self.status = UIStatus.OVERRIDE
       else:
         self.status = UIStatus.ENGAGED if ss.enabled else UIStatus.DISENGAGED

@@ -1,8 +1,14 @@
+---
+updated: 2026-09-05          # git-derived; bump when you edit this file
+status: current        # current | drifted | superseded | unreviewed
+---
+
 # MADS2PNW — "lateral survives a brake press"
 
-**Branches:** `mads2pnw` in `dirkpetersen/pnw-pilot` and in `dirkpetersen/pnw-opendbc`.
-**Status: BUILT, REVIEWED, INERT.** It does nothing on the car until the panda is reflashed
-*and* the openpilot-side engagement work below lands. Do not merge to `3devpnw`/`3testpnw` yet.
+**Branches:** `mads2pnw` (panda safety C + the toggle) and `madsop2pnw` (the openpilot-side
+engagement state machine) in `dirkpetersen/pnw-pilot`; `mads2pnw` in `dirkpetersen/pnw-opendbc`.
+**Status: BUILT, REVIEWED, INERT.** It does nothing on the car until the panda is reflashed.
+Do not merge to `3devpnw`/`3testpnw` yet.
 
 ## The problem
 
@@ -132,16 +138,156 @@ bits to a panda that cannot honour them.
 
 ## ⚠️ What is NOT done — read before planning the flash
 
-### 1. The openpilot-side lateral engagement state machine is NOT ported
-sunnypilot's `sunnypilot/mads/mads.py` + `state.py` + its custom events and UI are **not** in this
-branch. Consequence: when the Ford PCM drops cruise on the brake press, openpilot still
-disengages, `selfdriveState.active` goes False, `controlsd` sets `CC.latActive = False`, and
-**openpilot stops sending steering commands**. The panda's new permission goes unused.
+### 1. ~~The openpilot-side lateral engagement state machine is NOT ported~~ — DONE, on `madsop2pnw`
+See *The openpilot side* below. Items 2 and 3 remain, and item 2 is still a hard pre-flash blocker.
 
-**So flashing the panda alone will not produce the behaviour the owner asked for.** That work is
-a separate, larger effort: a lateral-engagement state distinct from `enabled`, its own alerts, and
-a UI that never shows "disengaged" while the truck is steering itself. Do not shortcut it by
-latching `CC.latActive` in `controlsd` — that would steer while the UI says off.
+## The openpilot side (`madsop2pnw`)
+
+Ported from sunnypilot `sunnypilot/mads/{mads,state,helpers}.py` (via
+`sunny/bluepilot vin-lightning-2024-25`). Without it the panda's new permission goes unused:
+when the Ford PCM drops cruise on the brake, openpilot disengages, `selfdriveState.active` goes
+False, `controlsd` sets `CC.latActive = False`, and no steering command is sent.
+
+### What it is — and what it deliberately is not
+
+`selfdrive/selfdrived/mads_pnw.py` is a SECOND, parallel engagement state, published on its own
+message and consulted by its own branch in `controlsd`. It **never edits openpilot's own
+disengage**:
+
+* `selfdrived`'s state machine runs FIRST and is untouched. On a brake press openpilot still
+  disengages: `selfdriveState.enabled`/`.active` both go False, `CC.enabled` goes False,
+  longitudinal stops, and `mismatch_counter` — keyed on `self.enabled` — is *reset*, so
+  `controlsMismatch` can never fire because of this feature.
+* `mads.update()` runs immediately AFTER that, and only ever reads the frame's events. A test
+  parses the module with `ast` and fails if it ever calls `.remove()` or names `latActive`.
+
+The refused shortcut was to latch `CC.latActive`, or to suppress openpilot's own `pedalPressed`.
+Either gives "UI says engaged, car is not actuating": `mismatch_counter` climbs at 100 Hz and
+`controlsMismatch` hard-disables at 2.0 s (`selfdrived.py`, `events.py`). **Do not reintroduce it.**
+
+### The gate is `CarParams.alternativeExperience`, not a param
+
+`MadsPnw` is constructed from `self.CP.alternativeExperience` — the exact bitfield `card.py`
+handed the panda — and reads **no params at all**. openpilot therefore cannot hold an opinion the
+panda does not share, and the whole opt-in chain (`PnwVehicle.mads_lateral` + `PandaMadsSafety` +
+the `DisengageOnBrake` polarity) is inherited from `card.py` rather than re-derived. With
+`PandaMadsSafety=0` that bitfield is `0`, `available` is False, and every consumer falls back to
+`selfdriveState` — today's behaviour exactly.
+
+`MADS_PAUSE_LATERAL_ON_BRAKE` is **refused**: if the bit is ever set, MADS logs an error and
+declares itself unavailable rather than run a policy it does not model.
+
+### The state machine — a mirror of `opendbc/safety/pnw/mads.h`
+
+| panda | openpilot |
+|---|---|
+| latches on the RISING edge of `controls_allowed` | latches on the rising edge of `selfdrived.enabled` |
+| no MADS button, no ACC-main engage | same — openpilot's own engage is the only source |
+| clears on `controls_allowed` FALLING while `!braking.current` | clears on `enabled` falling unless `CS.brakePressed or CS.regenBraking` |
+| clears on the brake rising edge when DISENGAGE is set | the falling edge never latches when `disengage_on_brake` |
+| clears on ACC-main falling | `wrongCarMode` (= `not cruiseState.available`) is a blocking event |
+
+Deliberately **narrower** than the panda in two places, both fail-to-stock (openpilot simply stops
+steering where the panda would still have permitted it — which costs nothing, because openpilot is
+the only thing that ever sends a steering command):
+
+1. **Any other disabling event ends lateral, even mid-brake.** The panda's `!braking.current` test
+   would let a CANCEL press *during* a brake keep the latch; here it does not. "Disabling" =
+   carrying `ET.USER_DISABLE`, `ET.IMMEDIATE_DISABLE` or `ET.SOFT_DISABLE`, which is what covers
+   the reverse-gear / door-open / ESP / ACC-main-off class of hazard. `ET.NO_ENTRY` is excluded
+   (it gates *entering* engagement, and `belowEngageSpeed` is NO_ENTRY-only and true for long
+   stretches of ordinary driving).
+2. Exactly **two** events are tolerated, and a test asserts the list is exactly these two:
+   `pedalPressed` (openpilot's own brake disengage — its *gas* case cannot smuggle lateral through
+   because the falling edge additionally requires the brake to be down) and `pcmDisable` (the
+   stock PCM dropping cruise; `car_specific.py` re-raises it EVERY frame while cruise is off, not
+   just on the falling edge, which is what makes the lateral-only state last).
+
+Releasing the brake does **not** end it. That is the point: the brake took the speed, not the
+steering — and the panda's latch does not reset either.
+
+### One divergence the mirror had to close: the panda revokes first
+
+The panda sets `controls_allowed` on the **rising edge of stock cruise engaging**. So if cruise
+comes back while openpilot does *not* engage with it — a `NO_ENTRY` is standing (calibration
+incomplete after a car swap, `resumeBlocked`, distracted, …) — `controlsd` sends
+`cruiseControl.cancel`, stock cruise drops, and the panda sees `controls_allowed` **fall with the
+brake up**, which revokes `controls_allowed_lateral`. openpilot would see no edge of its own and
+keep commanding lateral into a panda that is now blocking it: a **silent** no-steer, with no
+detector at all (this tree's `PandaState` has no `controls_allowed_lateral` field, so there is no
+lateral `mismatch_counter`). `MadsPnw` therefore tracks the same cruise **rising edge** and stands
+down. It must be the rising edge, not a level test: right after a brake press
+`cruiseState.enabled` can still read True for a frame or two before the PCM drops it, and a level
+test there would kill the feature on the very frame it arms. (Found by the Fable review, which
+then verified that the rising edge is the *exact* mirror and not a compromise: on the Ford the
+panda's `controls_allowed` has exactly **one** rising source — `pcm_cruise_check()` at
+`ford.h:512`, driven by `CcStat_D_Actl in (4,5)` — which is the same signal `carstate.py:74`
+decodes into `cruiseState.enabled`. So "panda `controls_allowed` rises" ⟺ "`cruiseState.enabled`
+rises", frame for frame. The one case it cannot see is a sub-10 ms `CcStat` blip that the panda
+observes per-message and `card`'s 100 Hz snapshot misses — a level test would miss that too, and
+only the `controlsAllowedLateral` mismatch counter of pre-flash item 3 can catch it.)
+
+### Two consequences of "openpilot is disengaged while steering"
+
+Both were found by review and are fixed here; both are the same class of bug — a subsystem that
+keys off `selfdriveState.enabled` and quietly switches itself off exactly while the truck steers.
+
+1. **`ET.WARNING` alerts were being swallowed.** In lateral-only openpilot's own state machine sits
+   in `disabled`, whose `current_alert_types` is `[ET.PERMANENT]`, and `update_alerts()` *clears*
+   every WARNING that is not in that list. `steerSaturated` ("Take Control") is still raised
+   (`lac.active` is true), lane changes still execute, `belowSteerSpeed` still applies — and none
+   of them would have been shown or sounded. `selfdrived.step()` now re-admits `ET.WARNING` for
+   exactly the frames `mads.active and not self.active`.
+2. **Driver monitoring reset every frame.** `helpers.py` fed `op_engaged` from
+   `selfdriveState.enabled`, so `_update_events()` took the `not op_engaged` branch and called
+   `_reset_awareness()` — i.e. zero distraction monitoring while the car steered itself.
+   `dmonitoringd` now subscribes to `madsState` and `op_engaged` is
+   `selfdriveState.enabled or (madsState.available and madsState.lateralOnly)`.
+
+### Behaviour to expect on the first drive
+
+Braking to a full stop leaves MADS latched. Pulling away manually with cruise still off means the
+truck **starts steering again** above `minSteerSpeed`, with the "Steering only" banner and the grey
+border but no cruise. That is REMAIN_ACTIVE working as specified (stock Ford Lane Centering behaves
+the same way), but it is the moment most likely to surprise the driver — check it deliberately.
+
+### Reading these logs with upstream tools
+
+`madsLateralOnly @101` is a fork-local `EventName` (as `greenLight @99` / `leadDeparting @100`
+already are). An unmodified upstream `logreader` will raise on `onroadEvents` from a route that
+contains it — analysis needs this branch's `cereal`.
+
+### The wire
+
+New `madsState` message (`cereal/custom.capnp`, `CustomReserved10` @136 renamed — the same idiom
+`VtscState`/`MapdOut` used): `available` / `enabled` / `active` / `lateralOnly` /
+`disengageOnBrake`. `selfdrived` publishes it every frame **immediately before** `selfdriveState`,
+so `controlsd` — which polls on `selfdriveState` — always finds the same frame's authority already
+queued. `Controls.lat_authorised()` is the single place that reads it and falls back to
+`selfdriveState.active` whenever it is unavailable, stale or invalid.
+
+### The UI must never say "disengaged" while the truck steers
+
+* New event `madsLateralOnly` (`ET.PERMANENT` only, so it cannot influence the state machine that
+  already ran) paints a persistent **"Steering only / Cruise is off - openpilot is still
+  steering"** banner.
+* `ui_state.py` paints `UIStatus.OVERRIDE` (grey) instead of `DISENGAGED` while
+  `madsState.lateralOnly`. Guarded on `available`, so it is dead code on every car without the
+  flashed panda.
+
+### Files
+
+| File | Change |
+|---|---|
+| `selfdrive/selfdrived/mads_pnw.py` | new — the state machine (pure: no params, no sockets, no clock) |
+| `selfdrive/selfdrived/selfdrived.py` | construct from `CP.alternativeExperience`; `mads.update()` after the state machine; raise the alert; publish `madsState` before `selfdriveState` |
+| `selfdrive/controls/controlsd.py` | `lat_authorised()`; used by `CC.latActive` and the `steer_limited_by_safety` check |
+| `selfdrive/selfdrived/events.py` | the `madsLateralOnly` banner |
+| `selfdrive/ui/ui_state.py` | OVERRIDE instead of DISENGAGED while lateral-only |
+| `cereal/{custom,log}.capnp`, `cereal/services.py` | the `madsState` message + the `madsLateralOnly` event name |
+| `selfdrive/monitoring/dmonitoringd.py`, `selfdrive/monitoring/helpers.py` | driver monitoring counts lateral-only as engaged |
+| `selfdrive/test/process_replay/process_replay.py` | `madsState` added to dmonitoringd's pubs |
+| `selfdrive/selfdrived/tests/test_mads_pnw.py` | new — 64 tests |
 
 ### 2. No lateral watchdog (`heartbeat_engaged_mads`) — HARD BLOCKER for flashing
 `panda/board/main.c` has a 3-second watchdog for `controls_allowed`:
@@ -166,12 +312,19 @@ plus `heartbeat_engaged_mads` / `heartbeat_engaged_mads_mismatches` globals and
 `mads_heartbeat_engaged_check()` restored in `opendbc/safety/pnw/mads.h` (it was removed here
 rather than shipped as unused code that trips MISRA 8.7 — the exact upstream body is in
 `sunny/bluepilot/opendbc_repo/opendbc/safety/sunnypilot/mads.h`). pandad must then send a real
-"openpilot still wants lateral" flag, which only exists once item 1 lands. **The two are coupled:
-neither the watchdog nor the flash is safe without the openpilot-side state.**
+"openpilot still wants lateral" flag. That flag now exists — `madsState.active` (or
+`madsState.enabled`) is exactly it, and `pandad` is where it must be plumbed into the `0xf3`
+heartbeat's `param2`. **The flash is still blocked on this: without the watchdog the panda has no
+way to notice that openpilot died while lateral authority was latched.**
 
-### 3. Latch state is invisible
-Nothing publishes `controls_allowed_lateral` — no health field, no `PandaState`, no `ces_events`.
-Add it with item 2 so `selfdrived` can cross-check it and telemetry can see it.
+### 3. Latch state is invisible ON THE PANDA SIDE
+`madsop2pnw` publishes openpilot's view (`madsState`), but nothing publishes the panda's
+`controls_allowed_lateral` — no health field, no `PandaState`, no `ces_events`. Until it does,
+there is **no lateral equivalent of `mismatch_counter`**: openpilot cannot tell that the panda
+dropped lateral authority while it kept commanding it (the failure would be silent — the panda
+blocks the tx and the truck simply stops steering). sunnypilot's `mads.py` has exactly this check
+(`lateral_mismatch_counter` over `pandaStates[].controlsAllowedLateral`); it is **not ported here
+because the field does not exist in this tree's panda**. Add it with item 2.
 
 ## The panda flash procedure (owner's call, with the cars present — NOT done here)
 

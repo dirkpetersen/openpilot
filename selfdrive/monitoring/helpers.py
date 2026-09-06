@@ -699,7 +699,11 @@ class DriverMonitoring:
       rpyCalib = [0., 0., 0.]
     else:
       highway_speed = sm['carState'].vEgo
-      enabled = sm['selfdriveState'].enabled
+      # madsop2pnw: openpilot is 'engaged' for monitoring purposes whenever it is STEERING, which
+      # includes MADS holding lateral alone after a brake press. Reading selfdriveState.enabled
+      # alone would switch driver monitoring off exactly while the car steers itself.
+      mads = sm['madsState']
+      enabled = sm['selfdriveState'].enabled or (mads.available and mads.lateralOnly)
       wrong_gear = sm['carState'].gearShifter not in (car.CarState.GearShifter.drive, car.CarState.GearShifter.low)
       standstill = sm['carState'].standstill
       driver_engaged = sm['carState'].steeringPressed or sm['carState'].gasPressed

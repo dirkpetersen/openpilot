@@ -10,7 +10,12 @@ def dmonitoringd_thread():
 
   params = Params()
   pm = messaging.PubMaster(['driverMonitoringState'])
-  sm = messaging.SubMaster(['driverStateV2', 'liveCalibration', 'carState', 'selfdriveState', 'modelV2'], poll='driverStateV2')
+  # madsop2pnw: 'madsState' -- while MADS holds lateral alone, selfdriveState.enabled is False but
+  # openpilot IS steering. Without this, _update_events() takes the (not op_engaged) branch and
+  # RESETS awareness every frame, i.e. no distraction monitoring at all while the truck steers
+  # itself. Inert today: madsState.available is False unless the MADS panda is flashed.
+  sm = messaging.SubMaster(['driverStateV2', 'liveCalibration', 'carState', 'selfdriveState', 'modelV2',
+                            'madsState'], poll='driverStateV2')
 
   DM = DriverMonitoring(rhd_saved=params.get_bool("IsRhdDetected"), always_on=params.get_bool("AlwaysOnDM"))
   demo_mode=False

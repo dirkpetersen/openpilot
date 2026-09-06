@@ -52,7 +52,31 @@ struct VtscState @0xa1680744031fdb2d {
   timeToApex @9 :Float32;    # s, apexDist / vEgo (-1 if none)
 }
 
-struct CustomReserved10 @0xcb9fd56c7057593a {
+# mads2pnw / madsop2pnw: the openpilot-side view of the panda's parallel lateral authority
+# (controls_allowed_lateral). Reuses the CustomReserved10 wire ID (@0xcb9fd56c7057593a) — same
+# slot, renamed, exactly as VtscState/MapdOut did.
+#
+# This is the ONLY channel by which controlsd learns that lateral is still authorised while
+# openpilot itself is disengaged. It is published by selfdrived every frame, next to
+# selfdriveState, and is authoritative ONLY when `available` is true.
+struct MadsState @0xcb9fd56c7057593a {
+  # The ENABLE_MADS bit actually reached the panda this boot (car capability + PandaMadsSafety,
+  # decoded from CarParams.alternativeExperience). False => this message carries no authority and
+  # every consumer must fall back to selfdriveState. False on the Raven, and on the Lightning
+  # until the panda is flashed and PandaMadsSafety is set by hand.
+  available @0 :Bool;
+  # Lateral authority is latched. Mirrors the panda's controls_allowed_lateral.
+  enabled @1 :Bool;
+  # openpilot should command lateral this frame. Equals selfdriveState.active whenever openpilot
+  # itself is engaged; the two only differ in the lateralOnly state below.
+  active @2 :Bool;
+  # THE new state: steering is live while openpilot's own engagement is gone (the driver braked,
+  # the PCM dropped cruise). Drives the "steering only" alert and the UI's engagement colour so
+  # the car is never steering behind a UI that says "disengaged".
+  lateralOnly @3 :Bool;
+  # The MADS_DISENGAGE_LATERAL_ON_BRAKE policy bit as sent to the panda, i.e. the "Disengage on
+  # brake" toggle as it was latched at car init. Reported so a log can be read without guessing.
+  disengageOnBrake @4 :Bool;
 }
 
 struct CustomReserved11 @0xc2243c65e0340384 {

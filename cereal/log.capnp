@@ -90,6 +90,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     stockLkas @98;
     greenLight @99;  # greenlight2pnw: model released a held standstill with NO lead (green-light ding) — display/sound only
     leadDeparting @100;  # greenlead2pnw: stopped lead pulled away while we sit at a standstill — display/sound only
+    madsLateralOnly @101;  # madsop2pnw: steering is live while openpilot's own engagement is gone — banner only, no control path
     ldw @53;
     carUnrecognized @54;
     invalidLkasSetting @55;
@@ -2649,7 +2650,7 @@ struct Event {
     customReserved7 @114 :Custom.CustomReserved7;
     customReserved8 @115 :Custom.CustomReserved8;
     vtscState @116 :Custom.VtscState;  # ces2pnw: renamed from CustomReserved9 (same @116 wire slot)
-    customReserved10 @136 :Custom.CustomReserved10;
+    madsState @136 :Custom.MadsState;  # madsop2pnw: renamed from CustomReserved10 (same @136 wire slot)
     customReserved11 @137 :Custom.CustomReserved11;
     customReserved12 @138 :Custom.CustomReserved12;
     customReserved13 @139 :Custom.CustomReserved13;

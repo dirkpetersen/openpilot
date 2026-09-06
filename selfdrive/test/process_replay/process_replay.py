@@ -494,7 +494,7 @@ CONFIGS = [
   ),
   ProcessConfig(
     proc_name="dmonitoringd",
-    pubs=["driverStateV2", "liveCalibration", "carState", "modelV2", "selfdriveState"],
+    pubs=["driverStateV2", "liveCalibration", "carState", "modelV2", "selfdriveState", "madsState"],  # madsop2pnw
     subs=["driverMonitoringState"],
     ignore=["logMonoTime"],
     should_recv_callback=MessageBasedRcvCallback("driverStateV2"),

@@ -22,6 +22,7 @@ from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
 from openpilot.selfdrive.controls.lib.ces_pnw.ces_pnw import CESController, CESStub  # ces2xnor / stophold2pnw
 from openpilot.selfdrive.controls.lib.ces_pnw.green_light import attentive_now  # dmgate2pnw: attention gate
 from openpilot.selfdrive.selfdrived.state import StateMachine
+from openpilot.selfdrive.selfdrived.mads_pnw import MadsPnw  # madsop2pnw: parallel lateral authority
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
 
 from openpilot.system.version import get_build_metadata
@@ -85,7 +86,7 @@ class SelfdriveD:
     self.excessive_actuation = self.params.get("Offroad_ExcessiveActuation") is not None
 
     # Setup sockets
-    self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'])
+    self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents', 'madsState'])  # madsop2pnw
 
     self.gps_location_service = get_gps_location_service(self.params)
     self.gps_packets = [self.gps_location_service]
@@ -132,6 +133,13 @@ class SelfdriveD:
     self.CS_prev = car.CarState.new_message()
     self.AM = AlertManager()
     self.events = Events()
+
+    # madsop2pnw: the PARALLEL lateral authority. Constructed from CarParams.alternativeExperience
+    # -- the exact bitfield card.py handed the panda -- and NOT from params, so openpilot can never
+    # hold an opinion the panda does not share. With PandaMadsSafety=0 (the shipping default, and
+    # every non-Lightning car) that bitfield is 0, so this is inert and every consumer falls back to
+    # selfdriveState. It runs AFTER our own state machine and never removes an event from it.
+    self.mads = MadsPnw(self.CP.alternativeExperience)
 
     self.initialized = False
     self.enabled = False
@@ -582,6 +590,19 @@ class SelfdriveD:
     ss.alertSound = self.AM.current_alert.audible_alert
     ss.alertHudVisual = self.AM.current_alert.visual_alert
 
+    # madsop2pnw: publish the lateral authority BEFORE selfdriveState. controlsd polls on
+    # selfdriveState, so sending madsState first guarantees the frame's madsState is already queued
+    # when controlsd wakes -- the two can never be read a frame apart in the direction that matters.
+    mads_msg = messaging.new_message('madsState')
+    mads_msg.valid = True
+    ms = mads_msg.madsState
+    ms.available = self.mads.available
+    ms.enabled = self.mads.enabled
+    ms.active = self.mads.active
+    ms.lateralOnly = self.mads.lateral_only
+    ms.disengageOnBrake = self.mads.disengage_on_brake
+    self.pm.send('madsState', mads_msg)
+
     self.pm.send('selfdriveState', ss_msg)
 
     # onroadEvents - logged every second or on change
@@ -597,6 +618,31 @@ class SelfdriveD:
     self.update_events(CS)
     if not self.CP.passive and self.initialized:
       self.enabled, self.active = self.state_machine.update(self.events)
+
+    # madsop2pnw: run the parallel lateral authority AFTER our own state machine has already
+    # decided self.enabled/self.active. Order matters and is the whole safety argument: openpilot's
+    # own disengage has ALREADY happened and is never edited, so mismatch_counter (keyed on
+    # self.enabled, reset above) cannot climb because of this, and controlsMismatch cannot fire.
+    # MADS only answers the separate question "may openpilot still steer?".
+    self.mads.update(self.enabled, self.active, CS.brakePressed or CS.regenBraking,
+                     CS.cruiseState.enabled, self.events)
+    if self.mads.active and not self.active:
+      # madsop2pnw: openpilot is STEERING while its own state machine sits in `disabled`, whose
+      # current_alert_types is [ET.PERMANENT] only -- so update_alerts() below would CLEAR every
+      # ET.WARNING alert. That silently swallows "Take Control" (steerSaturated, which IS still
+      # raised because lac.active is true), the lane-change prompts (lane changes still execute in
+      # this state), belowSteerSpeed and steerTempUnavailableSilent. Re-admit WARNING for exactly
+      # the frames MADS is steering alone. The list is rebuilt from scratch at the top of every
+      # StateMachine.update(), and is read only by update_alerts(), so appending here cannot leak
+      # into engagement. (Fable review 2026-09-05; mirrors sunnypilot's
+      # StateMachine.add_current_alert_types(ET.WARNING).)
+      self.state_machine.current_alert_types.append(ET.WARNING)
+    if self.mads.lateral_only:
+      # ET.PERMANENT only -- no disable/no-entry type, so adding it here cannot influence the state
+      # machine that already ran, and cannot change ss.engageable. It exists so the car is never
+      # steering behind a UI that just says "disengaged".
+      self.events.add(EventName.madsLateralOnly)
+
     self.update_alerts(CS)
 
     # ces2xnor: effective experimental = manual ExperimentalMode OR CES's per-cycle decision.

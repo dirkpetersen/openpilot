@@ -515,6 +515,19 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 3.),
   },
 
+  # madsop2pnw: MADS is holding lateral alone -- the driver braked, the stock PCM dropped cruise,
+  # openpilot is DISENGAGED (selfdriveState.enabled False, longitudinal stopped) and steering is
+  # still live. A permanent banner because the one thing this feature must never do is steer behind
+  # a UI that says "disengaged". ET.PERMANENT ONLY: it carries no disable/no-entry type, so adding
+  # it after the state machine has run cannot influence engagement. Display only, no control path.
+  EventName.madsLateralOnly: {
+    ET.PERMANENT: Alert(
+      "Steering only",
+      "Cruise is off - openpilot is still steering",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, .2),
+  },
+
   EventName.ldw: {
     ET.PERMANENT: Alert(
       "Lane Departure Detected",

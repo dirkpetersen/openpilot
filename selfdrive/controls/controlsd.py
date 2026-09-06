@@ -82,9 +82,12 @@ class Controls:
 
     self.CI = interfaces[self.CP.carFingerprint](self.CP)
 
+    # madsop2pnw: 'madsState' is the parallel lateral authority published by selfdrived immediately
+    # BEFORE selfdriveState every frame, so polling on selfdriveState always finds it already queued.
     self.sm = messaging.SubMaster(['liveDelay', 'liveParameters', 'liveTorqueParameters', 'modelV2', 'selfdriveState',
                                    'liveCalibration', 'livePose', 'longitudinalPlan', 'carState', 'carOutput',
-                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance'], poll='selfdriveState')
+                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'madsState'],
+                                  poll='selfdriveState')
     self.pm = messaging.PubMaster(['carControl', 'controlsState'])
 
     self.steer_limited_by_safety = False
@@ -248,6 +251,25 @@ class Controls:
         self._lane_centering_enabled = False
     self._lane_centering_frame += 1
 
+  def lat_authorised(self) -> bool:
+    """madsop2pnw: may openpilot command lateral this frame?
+
+    This is the ONLY place controlsd asks the question, and it is a strict superset of the stock
+    answer (`selfdriveState.active`) that adds exactly one case: MADS is holding lateral alone
+    after a brake press. Everything else -- steer faults, standstill, the lateral controller's own
+    limits -- is applied by the callers, unchanged.
+
+    Falls back to the stock answer whenever madsState is not authoritative: not available (the
+    shipping default, every non-Lightning car, and the Lightning until the panda is flashed and
+    PandaMadsSafety is set), not yet received, stale, or invalid. Every one of those is the
+    fail-to-stock direction: openpilot steers only where it steers today.
+    """
+    if self.sm.alive['madsState'] and self.sm.valid['madsState']:
+      mads = self.sm['madsState']
+      if mads.available:
+        return bool(mads.active)
+    return bool(self.sm['selfdriveState'].active)
+
   def state_control(self):
     CS = self.sm['carState']
 
@@ -275,7 +297,7 @@ class Controls:
 
     # Check which actuators can be enabled
     standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, 0.3) or CS.standstill
-    CC.latActive = self.sm['selfdriveState'].active and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
+    CC.latActive = self.lat_authorised() and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
                    (not standstill or self.CP.steerAtStandstill)
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
 
@@ -879,7 +901,7 @@ class Controls:
       hudControl.leftLaneDepart = self.sm['driverAssistance'].leftLaneDeparture
       hudControl.rightLaneDepart = self.sm['driverAssistance'].rightLaneDeparture
 
-    if self.sm['selfdriveState'].active:
+    if self.lat_authorised():
       CO = self.sm['carOutput']
       if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
         self.steer_limited_by_safety = abs(CC.actuators.steeringAngleDeg - CO.actuatorsOutput.steeringAngleDeg) > \
