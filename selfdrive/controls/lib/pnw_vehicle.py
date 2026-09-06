@@ -314,6 +314,16 @@ class PnwVehicle:
     # brake tap does not leave it with nothing. Every other car: False.
     self.mads_lateral: bool = fp == "FORD_F_150_LIGHTNING_MK1"
 
+    # madsresume2pnw: openpilot may tap the stock ACC's RESUME button once, on the driver's behalf,
+    # to give back the speed the driver had ALREADY SET, after a brake press left MADS steering
+    # alone. Needs BOTH halves and neither implies the other: the MADS lateral authority (which is
+    # what creates the state this feature completes) and the stock-ACC button path the tap rides on
+    # (button_management -- the same 0x083 SCCM frame as the SET+/- taps; a car with op-long has no
+    # stock ACC to resume). Mirrors opendbc/car/pnw_vehicle.py's identically-named field. The brain
+    # additionally refuses to publish unless madsState.available is true at runtime, so a stock
+    # (non-MADS) panda makes this inert even on a car that declares the capability.
+    self.mads_resume: bool = self.mads_lateral and self.button_management
+
     # nudgeless (blinker-hold) lane change support — BSM-gated in DesireHelper
     self.nudgeless: bool = brand == "tesla" or fp == "FORD_F_150_LIGHTNING_MK1"
 

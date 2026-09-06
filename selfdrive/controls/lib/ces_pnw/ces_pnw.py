@@ -1727,6 +1727,22 @@ class CESStub:
     # already failed) -- consistent with every other telemetry method missing here, this is a no-op.
     pass
 
+  _mads_resume_warned = False
+
+  def log_mads_resume(self, payload) -> None:
+    # madsresume2pnw: this method MUST exist here -- selfdrived calls it unconditionally, so without
+    # it the stub would crash selfdrived with AttributeError on the first brake. But unlike
+    # log_take_control_alert above it does NOT stay a silent no-op (Fable S3): CESController
+    # construction having failed means the auto-resume's ONLY forensic channel is gone for the whole
+    # drive, and "no madsResume records" is otherwise indistinguishable from "the brain never armed".
+    # Warn once per process rather than per record.
+    if not CESStub._mads_resume_warned:
+      CESStub._mads_resume_warned = True
+      try:
+        cloudlog.error("madsresume2pnw: CES is a stub (construction failed) -- auto-resume records are NOT being written this drive")
+      except Exception:
+        pass
+
 
 class CESController:
   """Live wrapper used by selfdrived. Owns the state machine + ~1 Hz param refresh + the 3-state
@@ -2652,6 +2668,63 @@ class CESController:
       self._append_event(rec)
     except Exception:
       pass
+
+  def log_mads_resume(self, payload: dict) -> None:
+    """madsresume2pnw: append one {"ev":"madsResume", ...} record to ces_events.jsonl.
+
+    Called ONLY by selfdrived (_mads_resume_step), and only on the brain's rare state transitions
+    (arm / fire / refuse / offerEnd / verify) -- never every tick. UNCONDITIONAL: it does NOT
+    depend on CESMode/_enabled, because the auto-resume decision is a selfdrived/MADS fact, not a
+    CES one, and the whole point of these records is that a refusal is visible on a drive with CES
+    switched off (the exact gap cessteerlog2pnw exists to close for the steering breadcrumb).
+
+    `payload` is plain Python (str/float/bool/None only), already built by the brain. This method
+    decides nothing and re-derives nothing; it only stamps the record with the fields ces already
+    has cached (car, CESMode, GPS from its own ~1 Hz refresh) and appends via _append_event.
+
+    READING THE LOG:
+      "phase":"arm"       -- a brake press left MADS steering alone; the window is open. `setMs` is
+                             the driver's captured set speed (null => gate 6 already failed).
+      "phase":"fire"      -- every gate passed; the offer is on the wire. Exactly one per arm.
+      "phase":"refuse"    -- the arm ended WITHOUT a resume. `reason` names the binding gate. Exactly
+                             one per arm, and mutually exclusive with "fire".
+      "phase":"offerEnd"  -- the offer was withdrawn; `reason` is "expired" or the gate that cut it.
+      "phase":"verify"    -- what the truck's set speed actually came back at after a press.
+                             reason "setHigher" (with "loud":true) is the one that matters: the PCM
+                             restored something ABOVE what the driver had set. reason "noCruise"
+                             means the press produced no re-engagement at all.
+    So: NO records at all for a brake event means the brain never armed (MADS off, toggle off, or
+    not this car). A record with "fired":false and a `reason` is an explained no-resume. Those two
+    are deliberately impossible to confuse, and neither can be confused with a resume that fired.
+
+    Defensive: any failure degrades to 'nothing logged' rather than raising -- the caller wraps this
+    too, since it ultimately runs inside selfdrived's 100 Hz loop."""
+    try:
+      now_wall = time.time()  # noqa: TID251 -- wall clock, rare edge-triggered append only
+      rec = {
+        "t": round(now_wall, 1),
+        "ev": "madsResume",
+        "car": self._car, "cesMode": self._mode,
+        "gps": self._cur_lat is not None and self._cur_lon is not None,
+        "lat": self._cur_lat, "lon": self._cur_lon, "bearing": self._cur_bearing,
+        "heading": _heading_if_fixed(self._cur_bearing,
+                                     self._cur_lat is not None and self._cur_lon is not None),
+      }
+      rec.update(payload)
+      if clock_bad(now_wall):
+        rec["clockBad"] = True
+      self._append_event(rec)
+    except Exception:
+      # Gemini review 2026-09-06: an `except Exception: pass` here would make the auto-resume's
+      # ONLY forensic channel fail silently, which is exactly what CLAUDE.md rule 2 forbids. These
+      # records are rare (a handful per brake event), so an unthrottled log cannot flood -- and a
+      # broken record builder must announce itself rather than leaving the drive log dark.
+      # (Disk-level append failures are ALREADY loud, via _append_event's consecutive-failure
+      # escalation; this catch is for the record-building above it.)
+      try:
+        cloudlog.exception("madsresume2pnw: failed to build/append the madsResume record -- this drive's auto-resume forensics are INCOMPLETE")
+      except Exception:
+        pass
 
   def _icbm_step(self, sig, active: bool) -> None:
     """Publish the IcbmTarget mem-param at ~4 Hz (executor treats >2 s silence as stale-stop).

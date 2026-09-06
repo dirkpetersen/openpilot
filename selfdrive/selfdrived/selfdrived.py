@@ -22,7 +22,9 @@ from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
 from openpilot.selfdrive.controls.lib.ces_pnw.ces_pnw import CESController, CESStub  # ces2xnor / stophold2pnw
 from openpilot.selfdrive.controls.lib.ces_pnw.green_light import attentive_now  # dmgate2pnw: attention gate
 from openpilot.selfdrive.selfdrived.state import StateMachine
-from openpilot.selfdrive.selfdrived.mads_pnw import MadsPnw  # madsop2pnw: parallel lateral authority
+from openpilot.selfdrive.selfdrived.mads_pnw import MadsPnw, has_blocking_event  # madsop2pnw: parallel lateral authority
+from openpilot.selfdrive.controls.lib.madsresume_pnw import MadsResumeBrain, ResumeInputs  # madsresume2pnw
+from openpilot.selfdrive.controls.lib.pnw_vehicle import PnwVehicle  # madsresume2pnw: capability view
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
 
 from openpilot.system.version import get_build_metadata
@@ -139,6 +141,35 @@ class SelfdriveD:
     # every non-Lightning car) that bitfield is 0, so this is inert and every consumer falls back to
     # selfdriveState. It runs AFTER our own state machine and never removes an event from it.
     self.mads = MadsPnw(self.CP.alternativeExperience)
+
+    # madsresume2pnw: the bounded auto-resume brain. Pure + inert by construction -- it refuses to
+    # do anything unless madsState.available is true AND the driver has opted in (MadsAutoResume,
+    # default OFF), so on the Tesla and on any stock-panda build it is a handful of boolean tests
+    # per tick and nothing else. Construction is wrapped for the same reason CESController's is:
+    # selfdrived is safety-critical and must never die for a telemetry/comfort feature.
+    self.mads_resume = None
+    self.mads_resume_mem = None
+    self.mads_resume_enabled = False
+    self.mads_resume_param_t = 0.0
+    self.mads_resume_offered = False        # is an offer currently published on /dev/shm?
+    self.mads_resume_pub_t = 0.0
+    self.mads_resume_fail = 0               # consecutive _mads_resume_step failures (loud, not silent)
+    try:
+      # Fable S2: gate on the SAME capability the executor gates on. `mads.available` alone is not
+      # enough -- PnwVehicle.mads_resume additionally requires button_management (stock-ACC buttons
+      # AND no op-long). With Alpha Longitudinal enabled the executor is structurally inert, so
+      # without this the brain would fire every brake event into a mem-param nobody reads and log a
+      # `noCruise` every time: a feature that cannot do its job, failing quietly. Capability view,
+      # never a fingerprint test (driver directive).
+      veh = PnwVehicle(self.CP)
+      if not veh.mads_resume:
+        self.mads_resume = None
+      else:
+        self.mads_resume = MadsResumeBrain()
+        self.mads_resume_mem = Params("/dev/shm/params")
+    except Exception:
+      cloudlog.exception("madsresume2pnw: construction FAILED -> auto-resume permanently inert")
+      self.mads_resume = None
 
     self.initialized = False
     self.enabled = False
@@ -656,6 +687,10 @@ class SelfdriveD:
     # MADS only answers the separate question "may openpilot still steer?".
     self.mads.update(self.enabled, self.active, CS.brakePressed or CS.regenBraking,
                      CS.cruiseState.enabled, self.events)
+    # madsresume2pnw: decide (never act -- the tap itself is the ford carcontroller's job) whether
+    # openpilot may hand back the speed the driver had already set. Runs AFTER mads.update so it
+    # sees THIS frame's lateral_only, not the previous one -- the arm edge must not be a frame late.
+    self._mads_resume_step(CS)
     if self.mads.active and not self.active:
       # madsop2pnw: openpilot is STEERING while its own state machine sits in `disabled`, whose
       # current_alert_types is [ET.PERMANENT] only -- so update_alerts() below would CLEAR every
@@ -692,6 +727,119 @@ class SelfdriveD:
     self.publish_selfdriveState(CS)
 
     self.CS_prev = CS
+
+  def _mads_resume_step(self, CS) -> None:
+    """madsresume2pnw: run the auto-resume brain and publish/withdraw its offer.
+
+    This method does ALL the I/O the brain deliberately refuses to do: the param read, the
+    radarState read, the /dev/shm publish, and the ces_events append. The brain itself is pure and
+    is where every gate lives (selfdrive/controls/lib/madsresume_pnw.py).
+
+    NOTHING FAILS SILENTLY (CLAUDE.md rule 2). Three separate visibility guarantees:
+      * a FAILED radarState read is passed to the brain as `has_lead=None`, which the lead gate
+        treats as a REFUSAL (`leadUnknown`) -- never as "no lead ahead, go ahead and resume";
+      * every arm produces exactly one terminal ces_events record naming the binding gate, so a
+        no-resume is always explained rather than merely absent;
+      * a repeated exception in THIS method is escalated to cloudlog.error rather than swallowed --
+        an auto-resume that has quietly stopped deciding must announce itself.
+    """
+    if self.mads_resume is None:
+      return
+    try:
+      now = time.monotonic()
+      # driver kill switch, re-read at ~1 Hz. Read-failure is treated as OFF (fail-closed).
+      if now - self.mads_resume_param_t > 1.0:
+        self.mads_resume_param_t = now
+        try:
+          self.mads_resume_enabled = bool(self.params.get_bool("MadsAutoResume"))
+        except Exception:
+          self.mads_resume_enabled = False
+          cloudlog.exception("madsresume2pnw: MadsAutoResume read failed -> treating as OFF")
+
+      # radarState.leadOne. THREE-STATE on purpose: True/False are real answers, None means the
+      # read itself failed (message not alive/valid, or malformed) -- which the brain refuses on.
+      has_lead = None
+      d_rel = v_lead = None
+      try:
+        if self.sm.alive['radarState'] and self.sm.valid['radarState']:
+          lead = self.sm['radarState'].leadOne
+          has_lead = bool(lead.status)
+          if has_lead:
+            d_rel = float(lead.dRel)
+            v_lead = float(lead.vLead)
+      except Exception:
+        has_lead = None
+
+      inputs = ResumeInputs(
+        now=now,
+        mads_available=bool(self.mads.available),
+        lateral_only=bool(self.mads.lateral_only),
+        op_enabled=bool(self.enabled),
+        blocked=has_blocking_event(self.events),
+        # Fable A1: the same expression publish_selfdriveState uses for ss.engageable. A NO_ENTRY
+        # carries no DISABLE type, so `blocked` above does NOT cover it -- see the noEntry gate.
+        engageable=not self.events.contains(ET.NO_ENTRY),
+        brake_pressed=bool(CS.brakePressed),
+        regen_braking=bool(CS.regenBraking),
+        gas_pressed=bool(CS.gasPressed),
+        cruise_enabled=bool(CS.cruiseState.enabled),
+        cruise_available=bool(CS.cruiseState.available),
+        set_speed_ms=float(CS.cruiseState.speed),
+        v_ego=float(CS.vEgo),
+        standstill=bool(CS.standstill),
+        has_lead=has_lead, d_rel=d_rel, v_lead=v_lead,
+        enabled=self.mads_resume_enabled,
+      )
+      out = self.mads_resume.update(inputs)
+
+      # --- publish / withdraw the offer -------------------------------------------------------
+      # Withdrawal is IMMEDIATE and unthrottled: the executor's freshness bound only limits how
+      # long a stale offer can survive, it does not shorten a live one, so the brain going quiet
+      # must reach /dev/shm on the very next tick.
+      if self.mads_resume_mem is not None:
+        if out.offer:
+          if now - self.mads_resume_pub_t >= 0.05:      # 20 Hz heartbeat (the executor re-reads
+            # this key EVERY frame while it holds a command, and at 4 Hz only while idle, so a
+            # withdrawal below lands within ~10 ms -- see carcontroller._resume_button)
+            self.mads_resume_pub_t = now
+            self.mads_resume_offered = True
+            self.mads_resume_mem.put_nonblocking("MadsResumeTarget", {
+              "dir": "res",
+              # MONOTONIC, not wall clock (Gemini review 2026-09-06). CLOCK_MONOTONIC is shared
+              # across processes on this host, so the executor can compare against its own
+              # time.monotonic(); wall clock could not be trusted for a 0.5 s freshness bound on a
+              # device with a dead RTC that takes a large step the first time it syncs. The dec/inc
+              # set-speed mem-params keep wall clock -- they are not this code and are not touched.
+              "ts": round(now, 3),
+              "eid": out.eid,
+              "set": round(out.set_ms, 2),
+            })
+        elif self.mads_resume_offered:
+          self.mads_resume_offered = False
+          self.mads_resume_mem.put_nonblocking("MadsResumeTarget", {})
+
+      # --- telemetry --------------------------------------------------------------------------
+      for rec in out.records:
+        if rec.get("phase") == "verify" and rec.get("reason") == "noCruise":
+          # Fable D1: we pressed RESUME and stock cruise never came back. Benign in isolation (the
+          # press may have been correctly ignored), but it is ALSO the exact signature of the
+          # executor being pinned without the matching panda safety gate, where every press is a TX
+          # violation the panda drops silently. Either way the feature could not do its job, so it
+          # must say so rather than leaving one quiet JSONL line as the only trace.
+          cloudlog.warning("madsresume2pnw: pressed RESUME, stock cruise never re-engaged -- check the panda safety pin (record: %s)", rec)
+        if rec.get("loud"):
+          cloudlog.error("madsresume2pnw: cruise resumed to %.2f m/s, ABOVE the driver's captured set speed %.2f m/s -- investigate (record: %s)",
+                         rec.get("gotMs", 0.0), rec.get("wantMs", 0.0), rec)
+        try:
+          self.ces_pnw.log_mads_resume(rec)
+        except Exception:
+          cloudlog.exception("madsresume2pnw: ces_events append failed")
+      self.mads_resume_fail = 0
+    except Exception:
+      self.mads_resume_fail += 1
+      # Loud on the first failure, then throttled -- this runs at 100 Hz.
+      if self.mads_resume_fail == 1 or self.mads_resume_fail % 1000 == 0:
+        cloudlog.exception(f"madsresume2pnw: _mads_resume_step FAILED ({self.mads_resume_fail} consecutive) -- auto-resume is NOT deciding")
 
   def _log_take_control_edge(self, CS) -> None:
     """takecontrol2pnw: PURE OBSERVATION — write the "Take Control" (steerSaturated) alert to
