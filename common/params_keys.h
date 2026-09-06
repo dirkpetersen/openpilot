@@ -145,7 +145,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // unlocking a longitudinal re-engagement), so it is default OFF per this fork's rule and is the
     // driver's kill switch for the whole feature. Inert on any car without mads_resume, and inert
     // whenever madsState.available is false. See docs/pnw/MADSRESUME2PNW.md.
-    {"MadsAutoResume", {PERSISTENT, BOOL, "0"}},
     // lanecenter2pnw: small bounded curvature trim toward lane-line center. Deliberately an OPT-OUT
     // (default "0" = NOT disabled = feature ON), the one exception to this fork's "new toggles
     // default OFF" rule — see selfdrive/controls/lib/lane_centering.py + toggles.py for why (the

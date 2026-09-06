@@ -143,14 +143,13 @@ class SelfdriveD:
     self.mads = MadsPnw(self.CP.alternativeExperience)
 
     # madsresume2pnw: the bounded auto-resume brain. Pure + inert by construction -- it refuses to
-    # do anything unless madsState.available is true AND the driver has opted in (MadsAutoResume,
-    # default OFF), so on the Tesla and on any stock-panda build it is a handful of boolean tests
-    # per tick and nothing else. Construction is wrapped for the same reason CESController's is:
+    # do anything unless madsState.available is true, and it can only ARM on the rising edge of
+    # lateral_only -- which mads_pnw can only produce when "Disengage on brake" is OFF (one
+    # control now governs both halves, onetoggle2pnw). So on the Tesla and on any stock-panda
+    # build it is a handful of boolean tests per tick and nothing else. Construction is wrapped for the same reason CESController's is:
     # selfdrived is safety-critical and must never die for a telemetry/comfort feature.
     self.mads_resume = None
     self.mads_resume_mem = None
-    self.mads_resume_enabled = False
-    self.mads_resume_param_t = 0.0
     self.mads_resume_offered = False        # is an offer currently published on /dev/shm?
     self.mads_resume_pub_t = 0.0
     self.mads_resume_fail = 0               # consecutive _mads_resume_step failures (loud, not silent)
@@ -747,15 +746,6 @@ class SelfdriveD:
       return
     try:
       now = time.monotonic()
-      # driver kill switch, re-read at ~1 Hz. Read-failure is treated as OFF (fail-closed).
-      if now - self.mads_resume_param_t > 1.0:
-        self.mads_resume_param_t = now
-        try:
-          self.mads_resume_enabled = bool(self.params.get_bool("MadsAutoResume"))
-        except Exception:
-          self.mads_resume_enabled = False
-          cloudlog.exception("madsresume2pnw: MadsAutoResume read failed -> treating as OFF")
-
       # radarState.leadOne. THREE-STATE on purpose: True/False are real answers, None means the
       # read itself failed (message not alive/valid, or malformed) -- which the brain refuses on.
       has_lead = None
@@ -788,7 +778,6 @@ class SelfdriveD:
         v_ego=float(CS.vEgo),
         standstill=bool(CS.standstill),
         has_lead=has_lead, d_rel=d_rel, v_lead=v_lead,
-        enabled=self.mads_resume_enabled,
       )
       out = self.mads_resume.update(inputs)
 

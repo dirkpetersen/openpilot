@@ -133,15 +133,6 @@ DESCRIPTIONS = {
   ),
   # madsresume2pnw: self-engagement, so it is a plain default-OFF opt-IN (not one of the inverted
   # opt-out toggles above). Wording is deliberately explicit about what it does and what bounds it.
-  "MadsAutoResume": tr_noop(
-    "After you brake and openpilot keeps steering (\"Steering only\"), let openpilot press the " +
-    "cruise RESUME button for you once you lift off the brake. It resumes ONLY to the speed you " +
-    "had already set -- never higher, never a new speed -- and only if the road ahead is clear: " +
-    "no close vehicle, no fast-closing vehicle, within a few seconds of releasing the brake, and " +
-    "once per brake press. Any further pedal input cancels it. Your foot stays on the brake, so " +
-    "you can always take it back. Ford F-150 Lightning only, and only with a panda flashed with " +
-    "the matching lateral-safety firmware. OFF by default."
-  ),
   # lanecenter2pnw: Lane Centering is ON by default; this is the opt-OUT toggle. Tuning lives in a
   # hot-reloaded file, not the UI, so the description points there rather than to sliders.
   "DisableLaneCentering": tr_noop(
@@ -241,12 +232,6 @@ class TogglesLayout(Widget):
       # madsresume2pnw: opt-IN, default OFF. needs_restart is False -- the brain reads the param at
       # ~1 Hz inside selfdrived, so a flip takes effect without an onroad cycle (and flipping it OFF
       # must take effect IMMEDIATELY, which a restart requirement would defeat).
-      "MadsAutoResume": (
-        lambda: tr("Auto-resume after brake"),
-        DESCRIPTIONS["MadsAutoResume"],
-        "disengage_on_accelerator.png",
-        False,
-      ),
       # lanecenter2pnw: opt-OUT toggle for a feature that ships ON by default (param default "0" =
       # not disabled). Same idiom as every other bool toggle here (toggle_item, no restart needed —
       # controlsd re-reads DisableLaneCentering at ~1 Hz, see controlsd.py).
@@ -580,12 +565,6 @@ class TogglesLayout(Widget):
     # and paint it OFF (inert) otherwise. DISPLAY ONLY -- no put_bool, same shared-device reason as
     # the clamp above: ONE physical device moves between the Tesla and the Lightning and a persisted
     # clamp would silently rewrite the driver's Lightning setting.
-    if "MadsAutoResume" in self._toggles:
-      resume_ok = veh.mads_resume and self._params.get_bool("PandaMadsSafety")
-      self._toggles["MadsAutoResume"].action_item.set_enabled(resume_ok)
-      if not resume_ok:
-        self._toggles["MadsAutoResume"].action_item.set_state(False)  # inert
-
     # angleenable / toggles-invert2pnw: Ford angle-primary lateral is only meaningful on the F-150
     # Lightning (the only car with the matching flashed 4-signal/angle-mode panda safety — capability
     # view, same stock_acc_buttons fingerprint basis icbm2pnw already uses for "this car is the
