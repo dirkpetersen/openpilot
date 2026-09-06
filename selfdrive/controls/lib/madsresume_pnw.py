@@ -148,10 +148,13 @@ class ResumeInputs:
   has_lead: bool | None
   d_rel: float | None = None
   v_lead: float | None = None
-  # MadsAutoResume toggle. The dataclass default is FALSE, not True: this is self-engagement, and
-  # a call site that forgets to pass the toggle must get the feature OFF, not on. (The real call
-  # site in selfdrived always passes it explicitly and treats a failed param read as OFF too.)
-  enabled: bool = False
+  # onetoggle2pnw: the separate MadsAutoResume toggle is GONE -- "Disengage on brake" governs both
+  # halves of the behaviour. This is not a loosening: the arm gate below requires the rising edge of
+  # `lateral_only`, and mads_pnw sets
+  #     lateral_only = (not disengage_on_brake) and braking and not blocked
+  # so lateral_only can ONLY be true when DisengageOnBrake is OFF. The toggle was therefore already
+  # implied by gate 1, and a second control that can never independently be false is a control the
+  # driver can be misled by. Pinned by test_resume_impossible_when_disengage_on_brake_is_on.
 
 
 @dataclass
@@ -233,7 +236,7 @@ class MadsResumeBrain:
     self._verify_set: float | None = None
     # Edge detector. THREE-STATE: None = "never observed", which is NOT the same fact as
     # "observed False" (Gemini review 2026-09-06). With a plain False, the first tick after the
-    # brain becomes active -- a selfdrived restart mid-drive, or the driver flipping MadsAutoResume
+    # brain becomes active -- e.g. a selfdrived restart mid-drive
     # on while already steering-only -- reads as a rising edge and ARMS without any brake
     # transition having been observed at all: precisely outside the bounded state. The first
     # observation now only SEEDS the detector; arming needs a genuine False->True after that.
@@ -300,7 +303,7 @@ class MadsResumeBrain:
 
     # --- gate 8: inert unless MADS is actually available (never acts on the Tesla) --------------
     # and gate 0: the driver-facing kill switch, default OFF.
-    if not i.mads_available or not i.enabled:
+    if not i.mads_available:
       # Hold every latch cleared so enabling mid-drive can never see a stale edge/arm. The edge
       # detector is SEEDED from this tick's observation rather than forced False: forcing False
       # while lateral_only is already True is exactly what would manufacture a rising edge on the

@@ -13,7 +13,25 @@ owner's own commit `32049e5f` on `pnw-opendbc/madsresume2pnw` and is **not touch
 pinnable matched set (safety gate + executor). Nothing in this work modifies `opendbc/safety/` or
 `panda/`.
 
-**Status: BUILT, TESTED, NOT DRIVEN. Ships default OFF (`MadsAutoResume`).** Depends on MADS being
+**Status: BUILT, TESTED, NOT DRIVEN. Governed by `DisengageOnBrake` (default OFF = active).**
+
+> **onetoggle2pnw (2026-09-06):** the separate auto-resume toggle is GONE at the driver's request.
+> **"Disengage on brake" alone governs both halves** — keeping lateral through the brake and
+> resuming afterwards. Not a loosening: `mads_pnw` sets
+> `lateral_only = (not disengage_on_brake) and braking and not blocked`, and the brain can only ARM
+> on the rising edge of `lateral_only`, so the toggle was already implied.
+>
+> **Two consequences, stated plainly:**
+> 1. **Auto-resume is now effectively default-ON** on a `PandaMadsSafety=1` Lightning, because
+>    `DisengageOnBrake` defaults OFF. A self-engagement feature now reaches the driver without a
+>    second opt-in — a deliberate deviation from this fork's "new toggles default OFF" rule, made by
+>    the owner with the objection on the table. It cannot reach the friends channel by accident
+>    because `PandaMadsSafety` is hand-set as part of the flash.
+> 2. **It is no longer an instant kill switch.** The old toggle was re-read at ~1 Hz, so flipping it
+>    OFF stopped a pending resume within a second. `DisengageOnBrake` is baked into
+>    `CP.alternativeExperience` at card start and is `needs_restart=True`, so flipping it mid-drive
+>    triggers an **onroad cycle** — openpilot restarts and must be re-engaged. To abort a resume in
+>    the moment, use the pedals: gas or brake cancels it. (Fable review 2026-09-06.) Depends on MADS being
 flashed and `PandaMadsSafety=1`; it is a handful of boolean tests per tick otherwise.
 
 ## The problem
@@ -80,7 +98,7 @@ one-shot press latch has a stable key). One field could not do both.
 | pnw-pilot | `selfdrive/selfdrived/selfdrived.py` | `_mads_resume_step()` — all the I/O |
 | pnw-pilot | `selfdrive/controls/lib/ces_pnw/ces_pnw.py` | `log_mads_resume()` → `ces_events.jsonl` |
 | pnw-pilot | `selfdrive/controls/lib/pnw_vehicle.py` | `mads_resume` capability |
-| pnw-pilot | `common/params_keys.h` | `MadsAutoResume`, `MadsResumeTarget` |
+| pnw-pilot | `common/params_keys.h` | `MadsResumeTarget` (the auto-resume key was removed in onetoggle2pnw) |
 | pnw-pilot | `selfdrive/ui/layouts/settings/toggles.py` | "Auto-resume after brake" |
 | pnw-opendbc | `opendbc/car/ford/icbm_pnw.py` | `ResumeCommand`/`parse_resume_cmd`/`decide_resume`/`ResumePress` |
 | pnw-opendbc | `opendbc/car/ford/carcontroller.py` | `_resume_button()` + the `create_button_msg(resume=True)` send |
@@ -97,7 +115,7 @@ Every one is a hard refusal; none is a "soft preference". `#` maps to the requir
 
 | # | Gate | Value | Why this value |
 |---|---|---|---|
-| 0 | `MadsAutoResume` | default **OFF** | Self-engagement. This fork's rule is that new toggles default OFF, and it is the driver's kill switch. Re-read at 1 Hz so flipping it OFF takes effect immediately. |
+| 0 | `DisengageOnBrake` OFF | implied by gate 1 | `lateral_only` can only be true when this is OFF, so the arm edge already carries it. Removed as a separate control in onetoggle2pnw. NOT an instant kill switch (`needs_restart`) — use the pedals to abort a resume in the moment. |
 | 8 | `madsState.available` | required | The panda's own contract (`alternativeExperience`), not a fingerprint. False on the Raven and on any unflashed panda → the brain does not even log. |
 | 1 | rising edge of `madsState.lateralOnly` | — | The ONLY arm trigger. A plain disengage (no MADS latch) never arms; a `lateralOnly` that ends aborts (`latOff`). |
 | 2 | `brakePressed` **and** `regenBraking` both false | — | "Fully released" includes regen: on an EV, foot-off-friction-brake is still deceleration. Enforced twice — the release clock only starts on full release, *and* a re-press after a release aborts (`reBrake`). ⚠️ **Honest caveat:** `regenBraking` is **never assigned in `opendbc/car/ford/carstate.py`** (only GM populates it), so on the Lightning — the only car this runs on — the regen half is **vacuous today**. It is kept because it is correct for any car that does report it and costs nothing, but the *effective* gate on this truck is `brakePressed` alone. |
@@ -142,7 +160,7 @@ never be confused, and neither can be confused with a resume that fired.
 
 Failure paths are loud too: a repeated exception in `_mads_resume_step` escalates to
 `cloudlog.exception` with a consecutive-failure count ("auto-resume is NOT deciding"), and a failed
-`MadsAutoResume` read logs and falls back to OFF.
+that param read logged and fell back to OFF; the path is gone with the toggle (onetoggle2pnw).
 
 ## Verification
 

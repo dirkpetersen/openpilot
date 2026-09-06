@@ -128,19 +128,14 @@ DESCRIPTIONS = {
     "Turn it OFF and openpilot keeps steering through a brake press -- braking still hands the " +
     "speed straight back to you, it just no longer takes the steering away too. On the F-150 " +
     "Lightning the truck's own adaptive cruise does the speed and openpilot only steers, so a " +
-    "brake tap otherwise takes away everything. Ford F-150 Lightning only, and only with a panda " +
-    "flashed with the matching lateral-safety firmware -- without it this is locked ON."
-  ),
-  # madsresume2pnw: self-engagement, so it is a plain default-OFF opt-IN (not one of the inverted
-  # opt-out toggles above). Wording is deliberately explicit about what it does and what bounds it.
-  "MadsAutoResume": tr_noop(
-    "After you brake and openpilot keeps steering (\"Steering only\"), let openpilot press the " +
-    "cruise RESUME button for you once you lift off the brake. It resumes ONLY to the speed you " +
-    "had already set -- never higher, never a new speed -- and only if the road ahead is clear: " +
-    "no close vehicle, no fast-closing vehicle, within a few seconds of releasing the brake, and " +
-    "once per brake press. Any further pedal input cancels it. Your foot stays on the brake, so " +
-    "you can always take it back. Ford F-150 Lightning only, and only with a panda flashed with " +
-    "the matching lateral-safety firmware. OFF by default."
+    "brake tap otherwise takes away everything.\n\n" +
+    "With this OFF, openpilot ALSO PRESSES RESUME FOR YOU once you lift fully off the brake, so " +
+    "cruise comes back without you touching a button. It resumes ONLY to the speed you had " +
+    "already set -- never higher, never a new speed -- and only if the road ahead is clear: no " +
+    "close vehicle, none closing fast, within a few seconds of releasing the brake, once per " +
+    "brake press. Any further pedal input cancels it, and your foot on the brake always wins.\n\n" +
+    "Ford F-150 Lightning only, and only with a panda flashed with the matching lateral-safety " +
+    "firmware -- without it this is locked ON."
   ),
   # lanecenter2pnw: Lane Centering is ON by default; this is the opt-OUT toggle. Tuning lives in a
   # hot-reloaded file, not the UI, so the description points there rather than to sliders.
@@ -232,20 +227,19 @@ class TogglesLayout(Widget):
       # is True because the panda only latches the MADS alternative_experience bits at safety-mode
       # init: without the onroad cycle _toggle_callback requests, flipping this would silently do
       # nothing until the next reboot.
+      #
+      # onetoggle2pnw, AND THE DRIVER NEEDS TO KNOW THIS: this now governs auto-resume too, and it
+      # is NOT an instant kill switch. The removed MadsAutoResume toggle was re-read at ~1 Hz, so
+      # flipping it OFF stopped a pending resume within a second. This one is baked into
+      # CP.alternativeExperience at card start, so flipping it mid-drive triggers an ONROAD CYCLE --
+      # openpilot restarts and must be re-engaged. Turning auto-resume off at speed therefore costs
+      # an engagement. Aborting a resume in the moment is what the pedals are for: gas or brake
+      # cancels it, and the brake is under the driver's foot throughout. (Fable review 2026-09-06.)
       "DisengageOnBrake": (
         lambda: tr("Disengage on brake"),
         DESCRIPTIONS["DisengageOnBrake"],
         "disengage_on_accelerator.png",
         True,
-      ),
-      # madsresume2pnw: opt-IN, default OFF. needs_restart is False -- the brain reads the param at
-      # ~1 Hz inside selfdrived, so a flip takes effect without an onroad cycle (and flipping it OFF
-      # must take effect IMMEDIATELY, which a restart requirement would defeat).
-      "MadsAutoResume": (
-        lambda: tr("Auto-resume after brake"),
-        DESCRIPTIONS["MadsAutoResume"],
-        "disengage_on_accelerator.png",
-        False,
       ),
       # lanecenter2pnw: opt-OUT toggle for a feature that ships ON by default (param default "0" =
       # not disabled). Same idiom as every other bool toggle here (toggle_item, no restart needed —
@@ -580,12 +574,6 @@ class TogglesLayout(Widget):
     # and paint it OFF (inert) otherwise. DISPLAY ONLY -- no put_bool, same shared-device reason as
     # the clamp above: ONE physical device moves between the Tesla and the Lightning and a persisted
     # clamp would silently rewrite the driver's Lightning setting.
-    if "MadsAutoResume" in self._toggles:
-      resume_ok = veh.mads_resume and self._params.get_bool("PandaMadsSafety")
-      self._toggles["MadsAutoResume"].action_item.set_enabled(resume_ok)
-      if not resume_ok:
-        self._toggles["MadsAutoResume"].action_item.set_state(False)  # inert
-
     # angleenable / toggles-invert2pnw: Ford angle-primary lateral is only meaningful on the F-150
     # Lightning (the only car with the matching flashed 4-signal/angle-mode panda safety — capability
     # view, same stock_acc_buttons fingerprint basis icbm2pnw already uses for "this car is the

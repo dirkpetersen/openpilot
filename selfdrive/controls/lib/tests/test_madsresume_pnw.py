@@ -24,7 +24,7 @@ def mk(now, **kw):
     now=now, mads_available=True, lateral_only=False, op_enabled=True, blocked=False,
     brake_pressed=False, regen_braking=False, gas_pressed=False,
     cruise_enabled=True, cruise_available=True, set_speed_ms=SET, v_ego=SET,
-    standstill=False, has_lead=False, d_rel=None, v_lead=None, enabled=True, engageable=True,
+    standstill=False, has_lead=False, d_rel=None, v_lead=None, engageable=True,
   )
   base.update(kw)
   return ResumeInputs(**base)
@@ -75,7 +75,7 @@ def normal_brake_and_resume(post_ticks=500, **overrides):
 
   `overrides` apply to the brake block AND the post-release block (never to the capture block, so
   the driver's set speed is always observed first) -- that is what lets `mads_available=False` and
-  `enabled=False` suppress the ARM edge itself rather than only the fire."""
+  the ARM edge itself is suppressed rather than only the fire."""
   d = Drive()
   d.tick(50)                                                        # capture the set speed
   brake = dict(lateral_only=True, op_enabled=False, cruise_enabled=False,
@@ -431,36 +431,6 @@ def test_gate8_inert_without_mads_even_on_the_arming_tick():
   assert not d.fired() and d.records == []
 
 
-def test_the_inputs_dataclass_defaults_the_toggle_to_off():
-  """A call site that forgets the toggle must get the feature OFF. Self-engagement fails closed."""
-  b = MadsResumeBrain()
-  bare = ResumeInputs(now=0.0, mads_available=True, lateral_only=False, op_enabled=True,
-                      blocked=False, engageable=True, brake_pressed=False, regen_braking=False,
-                      gas_pressed=False, cruise_enabled=True, cruise_available=True,
-                      set_speed_ms=SET, v_ego=SET, standstill=False, has_lead=False)
-  assert bare.enabled is False
-  out = b.update(bare)
-  assert out.offer is False and out.records == []
-
-
-def test_toggle_off_is_fully_inert():
-  d = normal_brake_and_resume(enabled=False)
-  assert not d.fired() and d.records == []
-
-
-def test_toggle_flipped_off_mid_window_stops_everything():
-  d = Drive()
-  d.tick(50)
-  d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True, set_speed_ms=0.0)
-  d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0, enabled=False)
-  assert not d.fired()
-
-
-# ---------------------------------------------------------------------------------------------
-# Review-driven hardening (Gemini + Fable, 2026-09-06)
-# ---------------------------------------------------------------------------------------------
-
 def test_a_first_observation_of_lateral_only_is_not_a_rising_edge():
   """selfdrived restarting mid-drive, or the toggle flipped on while ALREADY steering-only, must
   not read as a brake transition. The edge detector is three-state: None != observed-False."""
@@ -470,18 +440,6 @@ def test_a_first_observation_of_lateral_only_is_not_a_rising_edge():
   b = MadsResumeBrain()
   out = b.update(mk(0.0, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0))
   assert out.offer is False and out.records == [], "a first observation must only SEED the detector"
-
-
-def test_toggle_flipped_on_while_already_lateral_only_does_not_arm():
-  d = Drive()
-  d.tick(50)
-  # steering-only for a while with the feature OFF...
-  d.tick(200, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0,
-         enabled=False)
-  # ...driver flips it ON mid-episode. There was no observed brake transition, so nothing arms.
-  d.tick(600, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
-  assert not d.fired()
-  assert d.records == [], f"must not arm off a toggle flip; got {d.phases()}"
 
 
 def test_mads_becoming_available_mid_drive_while_lateral_only_does_not_arm():
@@ -636,3 +594,74 @@ def test_records_survive_nonfinite_inputs():
   for r in d.records:
     json.loads(json.dumps(r))
   assert not d.fired()
+
+
+class TestOneToggleGoverns:
+  """onetoggle2pnw: "Disengage on brake" alone governs BOTH halves.
+
+  Removing the separate MadsAutoResume toggle is not a loosening. mads_pnw sets
+      lateral_only = (not disengage_on_brake) and braking and not blocked
+  so lateral_only can ONLY be true when DisengageOnBrake is OFF -- and the resume brain can only
+  ARM on the rising edge of lateral_only. The toggle was already implied by that gate, and a second
+  control that can never independently be false is one the driver can be misled by.
+  """
+
+  @staticmethod
+  def _ev(*names):
+    from openpilot.selfdrive.selfdrived.events import Events
+    e = Events()
+    for n in names:
+      e.add(n)
+    return e
+
+  def test_resume_impossible_when_disengage_on_brake_is_on(self):
+    """With DisengageOnBrake ON (stock), mads_pnw never yields lateral_only -- so the resume brain
+    can never arm, with no separate toggle needed to hold it off."""
+    from openpilot.selfdrive.selfdrived.mads_pnw import MadsPnw
+    from openpilot.selfdrive.selfdrived.events import EventName, Events
+    from opendbc.safety import ALTERNATIVE_EXPERIENCE
+    m = MadsPnw(ALTERNATIVE_EXPERIENCE.ENABLE_MADS |
+                ALTERNATIVE_EXPERIENCE.MADS_DISENGAGE_LATERAL_ON_BRAKE)
+    m.update(True, True, False, True, Events())
+    for _ in range(50):
+      m.update(False, False, True, False, self._ev(EventName.pedalPressed))
+      assert not m.lateral_only, "DisengageOnBrake ON must never yield lateral_only"
+
+  def test_lateral_only_requires_disengage_on_brake_off(self):
+    """The converse -- with it OFF, lateral_only IS produced, which is the one edge the resume
+    brain arms on. Together these two show the removed toggle was redundant, not load-bearing."""
+    from openpilot.selfdrive.selfdrived.mads_pnw import MadsPnw
+    from openpilot.selfdrive.selfdrived.events import EventName, Events
+    from opendbc.safety import ALTERNATIVE_EXPERIENCE
+    m = MadsPnw(ALTERNATIVE_EXPERIENCE.ENABLE_MADS)
+    m.update(True, True, False, True, Events())
+    m.update(False, False, True, False, self._ev(EventName.pedalPressed))
+    assert m.lateral_only, "DisengageOnBrake OFF must yield lateral_only"
+
+  def test_no_stale_resume_param_remains(self):
+    """A key with no reader is still settable from a shell -- remove it, don't orphan it."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[4]
+    keys = (root / "common/params_keys.h").read_text()
+    assert '"MadsAutoResume"' not in keys, "stale key would still be settable"
+    assert '"DisengageOnBrake"' in keys, "the one remaining control must stay"
+
+    # Gemini 2026-09-06: checking params_keys.h alone is not enough -- ANY surviving reader
+    # anywhere would raise UnknownKeyName and crash-loop that process onroad. Scan the tree.
+    offenders = []
+    for pat in ("**/*.py", "**/*.cc", "**/*.h", "**/*.sh"):
+      for f in root.glob(pat):
+        if any(x in f.parts for x in (".git", ".venv", "site-packages", "third_party", "tests", "docs")):
+          continue
+        try:
+          text = f.read_text(errors="ignore")
+        except OSError:
+          continue
+        for i, line in enumerate(text.splitlines(), 1):
+          if "MadsAutoResume" not in line:
+            continue
+          st = line.strip()
+          if st.startswith(("#", "//")):
+            continue          # a comment recording why it went is fine
+          offenders.append(f"{f.relative_to(root)}:{i}: {st}")
+    assert not offenders, "live MadsAutoResume reader(s) survived:\n" + "\n".join(offenders)
