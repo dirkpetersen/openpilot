@@ -39,6 +39,8 @@ from openpilot.selfdrive.controls.lib.pnw_vehicle import PnwVehicle
 # (v_safe = v_ego*sqrt(A_LAT/|lat|)) so the two subsystems agree on what a camera-seen curve "means".
 # descentcurve2pnw: MAP_SOURCE_HORIZON_M is mapd's hard 500 m path cap — ICBM's full-horizon map scan
 # uses the same constant family as VTSC/MTSC so both scan exactly what mapd publishes.
+# icbmcurv2pnw: the SAME pure measurement VTSC uses, run on the ICBM path too (see below).
+from openpilot.selfdrive.controls.lib.vtsc_pnw.vtsc_pnw import polyline_curvature
 from openpilot.selfdrive.controls.lib.vtsc_pnw.vtsc_constants import (A_LAT_TARGET as VTSC_A_LAT,
                                                                       MAP_SOURCE_HORIZON_M,
                                                                       MAP_SCALE_MIN)
@@ -1763,6 +1765,14 @@ class CESController:
     self._button = C.BTN_CES
     self._toggles = {"curves": True, "stops": True, "low_speed": True, "lead": True}
     self._map_targets = []          # cached MapTargetVelocities (refreshed ~1 Hz)
+    # icbmcurv2pnw: measured curvature of the map polyline ahead. TELEMETRY ONLY.
+    # icbmKN == 0 means UNMEASURABLE, NOT straight -- k == 0.0 is ambiguous between the two
+    # (polyline_curvature docstring). Any gate built on this later MUST read icbmKN first.
+    self._icbm_k = 0.0
+    self._icbm_k_dist = 0.0
+    self._icbm_k_v = 0.0
+    self._icbm_k_n = 0
+    self._icbm_k_ahead = True
     self._cur_lat = self._cur_lon = self._cur_bearing = None
     self._car_gps = None       # cargps2pnw: last CarGps dict from the ford carstate (None on Tesla)
     # steerpower2pnw I3 review fix: bounded (wall_time, bearing, gps_valid) history, appended once per
@@ -1947,6 +1957,17 @@ class CESController:
     """Refresh map-curve inputs + GPS + OSM speed limit from the pfeiferj mem params (defensive — any
     failure => no map curve, vision fallback still works). GPS + speed limit are read regardless of
     the curves toggle because the event log wants them at all times."""
+    # icbmcurv2pnw: clear BEFORE anything can return, so icbmK* always describe the polyline cached
+    # on THIS refresh or nothing at all. Measured further down, once _map_targets and the GPS fix are
+    # both fresh. Resetting next to the measurement instead would let the mem_params early-return
+    # below clear _map_targets while icbmK* kept the PREVIOUS refresh's numbers -- a stale reading
+    # that is indistinguishable from a live one, which is the exact failure mode this whole change
+    # exists to remove.
+    self._icbm_k = 0.0
+    self._icbm_k_dist = 0.0
+    self._icbm_k_v = 0.0
+    self._icbm_k_n = 0
+    self._icbm_k_ahead = True
     if self.mem_params is None:
       self._map_targets = []
       return
@@ -1967,6 +1988,32 @@ class CESController:
       self._cur_bearing = float(pos.get("bearing", 0.0))
     except Exception:
       self._cur_lat = self._cur_lon = self._cur_bearing = None
+    # icbmcurv2pnw: measure the polyline geometry ICBM is about to act on. TELEMETRY ONLY -- no
+    # control path reads these, and polyline_curvature() is pure and documented never to raise.
+    # WHY IT LIVES HERE AND NOT IN VTSC: vtsc_controller.py:283 runs the same call, but its own
+    # guard comment (:278) says the measurement "exists only with CESMode>0 AND op-long AND
+    # VtscMapCurves=1". ICBM is the STOCK-ACC path -- op-long is False by definition on this truck --
+    # so that measurement never runs here, and `mapKN` reads 0 on every Lightning tick. That is why
+    # a mapd target of 20.3 m/s on a straight 70 mph road (2026-09-06 13:15) had nothing to
+    # contradict it. Measuring on THIS path is the prerequisite for any consistency check.
+    # DELIBERATELY NOT GATED to the Lightning: no fingerprint branches in feature code (the
+    # capability-view rule), and on the Tesla -- where VTSC measures the same polyline with the same
+    # A_LAT_TARGET (2.5 in both the DEFAULT and GENTLE profiles) -- icbmK/mapK on the same tick are a
+    # free equality check on this wiring, from real drive data, at no risk.
+    if self._map_targets and self._cur_lat is not None and self._cur_lon is not None:
+      k, kd, kv, kn, kahead = polyline_curvature(self._map_targets, self._cur_lat, self._cur_lon,
+                                                 MAP_SOURCE_HORIZON_M, VTSC_A_LAT, self._cur_bearing)
+      self._icbm_k = float(k)
+      self._icbm_k_dist = float(kd)
+      # isfinite, not `== inf`: a NaN would serialise as a bare `NaN` token, which is not valid JSON
+      # and would lose the WHOLE tick's snapshot, not just this field (same trap as mapKV).
+      # CONSEQUENCE, and it bites the obvious way round: icbmKV == 0.0 encodes "NO FINITE BOUND"
+      # (v_safe is inf on a straight road) as well as "unmeasurable". It NEVER means "0 m/s". Compare
+      # in curvature space (icbmK) -- a speed comparison against icbmKV fails on the straightest
+      # possible road, which is backwards. See docs/pnw/ICBMCURV2PNW.md section 5.
+      self._icbm_k_v = float(kv) if math.isfinite(kv) else 0.0
+      self._icbm_k_n = int(kn)
+      self._icbm_k_ahead = bool(kahead)
     # cargps2pnw: the CAR's own GPS fix (Ford only), published by the ford carstate from the GWM's
     # APIMGPS messages at 1 Hz. Logged ALONGSIDE the device's own fix above, never instead of it --
     # nothing here or downstream consumes it, this is a side-by-side comparison channel so a drive
@@ -2863,6 +2910,15 @@ class CESController:
       # floor active), icbmFlrHit = the floor actually raised the target on this tick. Without both
       # on the drive log there is no way to tell "the floor never applied" from "the floor applied
       # and was not needed" -- the exact ambiguity that made the 2026-08-11 over-slow hard to close.
+      # icbmcurv2pnw: what the polyline ACTUALLY says, beside what mapd claimed. icbmKN==0 means
+      # unmeasurable, not straight -- read it before believing icbmK. On the overlay feed as well as
+      # the event log because CESStatus is the 5 Hz live channel: `cat /dev/shm/params/d/CESStatus`
+      # answers "is the measurement running right now" without waiting for a drive.
+      tele["icbmK"] = round(float(self._icbm_k), 6)
+      tele["icbmKD"] = round(float(self._icbm_k_dist), 0)
+      tele["icbmKV"] = round(float(self._icbm_k_v), 1)
+      tele["icbmKN"] = int(self._icbm_k_n)
+      tele["icbmKAhead"] = bool(self._icbm_k_ahead)
       tele["icbmFlr"] = round(float(self._icbm_floor_lim), 1)
       tele["icbmFlrHit"] = bool(self._icbm_floor_hit)
       tele["icbmDir"] = self._icbm_dir           # icbmrestore2pnw: "dec" capping / "inc" restoring
@@ -3009,6 +3065,15 @@ class CESController:
       # ceiling, the truck's reported stock set speed + engagement. icbmT stepping the stockSet down
       # in consecutive ticks = executor taps landing.
       "icbmT": self._icbm_last_target, "icbmC": self._icbm_ceiling, "icbmSrc": self._icbm_src,
+      # icbmcurv2pnw: the map polyline's OWN geometry, beside the mapV/icbmT mapd asserted. NOT a
+      # verdict: `icbmKN > 0 and icbmK ~= 0` does NOT mean "no curve" -- a real 90-degree corner
+      # drawn with two 350 m legs among dense straight nodes reports exactly that, because only the
+      # straight triplets clear the spacing gate (reproduced; pinned by test_icbmcurv.py's
+      # test_a_coarse_corner_among_dense_nodes_is_a_MEASURED_ZERO). Read these as evidence, and read
+      # docs/pnw/ICBMCURV2PNW.md section 5 before building any gate on them.
+      "icbmK": round(float(self._icbm_k), 6), "icbmKD": round(float(self._icbm_k_dist), 0),
+      "icbmKV": round(float(self._icbm_k_v), 1), "icbmKN": int(self._icbm_k_n),
+      "icbmKAhead": bool(self._icbm_k_ahead),
       "icbmFlr": round(float(self._icbm_floor_lim), 1), "icbmFlrHit": bool(self._icbm_floor_hit),
       "icbmDir": self._icbm_dir,   # icbmrestore2pnw: "inc" rows in ces_events = restore taps
       "stockSet": self._stock_set, "stockOn": self._stock_on,
