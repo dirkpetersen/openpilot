@@ -22,16 +22,18 @@ import textwrap
 import pytest
 
 from cereal import car, log
+from openpilot.common.realtime import DT_CTRL
 from opendbc.safety import ALTERNATIVE_EXPERIENCE
 
 from openpilot.selfdrive.car.card import Car
 from openpilot.selfdrive.controls.controlsd import Controls
-from openpilot.selfdrive.selfdrived.events import EVENTS, ET, Events
+from openpilot.selfdrive.selfdrived.events import EVENTS, ET, Events, AudibleAlert
 from openpilot.selfdrive.selfdrived.selfdrived import SelfdriveD
 from openpilot.selfdrive.selfdrived.mads_pnw import (LATERAL_DISABLE_TYPES, MADS_TOLERATED_EVENTS,
                                                      MadsPnw, has_blocking_event)
 
 EventName = log.OnroadEvent.EventName
+State = log.SelfdriveState.OpenpilotState
 
 MADS_ON = ALTERNATIVE_EXPERIENCE.ENABLE_MADS
 MADS_DISENGAGE = ALTERNATIVE_EXPERIENCE.ENABLE_MADS | ALTERNATIVE_EXPERIENCE.MADS_DISENGAGE_LATERAL_ON_BRAKE
@@ -657,6 +659,28 @@ class TestLateralMismatchDetector:
     assert has_blocking_event(ev(EventName.madsControlsMismatchLateral))
     assert EventName.madsControlsMismatchLateral not in MADS_TOLERATED_EVENTS
 
+  def test_event_actually_reaches_the_driver(self):
+    """In the lateral-only state openpilot's own state machine sits in `disabled`, whose
+    current_alert_types is [ET.PERMANENT] ONLY. An IMMEDIATE_DISABLE/NO_ENTRY-only event would
+    therefore produce NO text and NO sound -- the exact silent failure this feature removes.
+    (Fable review 2026-09-05.)"""
+    from openpilot.selfdrive.selfdrived.state import StateMachine
+    types = EVENTS[EventName.madsControlsMismatchLateral]
+    assert ET.PERMANENT in types, "must be displayable from the `disabled` state"
+
+    sm = StateMachine()
+    sm.update(ev(EventName.madsControlsMismatchLateral))
+    assert sm.state == State.disabled
+    assert ET.PERMANENT in sm.current_alert_types
+
+    alerts = ev(EventName.madsControlsMismatchLateral).create_alerts(
+      sm.current_alert_types, [None, None, None, False, 0, 0])
+    assert len(alerts) == 1, "the driver must get an alert, not just a log line"
+    assert alerts[0].audible_alert != AudibleAlert.none, "and a sound"
+    # Alert.duration is stored in FRAMES (int(duration / DT_CTRL)), not seconds.
+    assert alerts[0].duration >= int(1.0 / DT_CTRL), \
+      "the event fires for ONE frame; the alert must outlive it by seconds, not frames"
+
 
 class TestPandadHeartbeatPlumbing:
   """The panda's lateral watchdog is fed by heartbeat 0xf3 param2. These pin the plumbing that
@@ -682,18 +706,35 @@ class TestPandadHeartbeatPlumbing:
     src = (self.PANDAD / "pandad.cc").read_text()
     assert "ps.setControlsAllowedLateral((bool)(health.controls_allowed_lateral_pkt));" in src
 
-  def test_health_packet_short_read_is_rejected_not_zero_filled(self):
+  def test_health_packet_short_read_is_flagged_not_zero_filled_silently(self):
     """The versioned-wire-struct guard: an old panda answers 0xd2 with fewer bytes than this build
-    expects, and the zero-initialised tail would read as a fabricated `false`."""
+    expects, and the zero-initialised tail would read as a fabricated `false`. It must be flagged
+    and logged, and (in connect) refused for any panda this build flashes."""
     src = (self.PANDAD / "panda.cc").read_text()
     assert "if (err != (int)sizeof(health)) {" in src
-    body = src.split("if (err != (int)sizeof(health)) {")[1][:500]
-    assert "health_packet_mismatch = true;" in body
-    assert "return std::nullopt;" in body
+    body = src.split("if (err != (int)sizeof(health)) {")[1][:600]
+    assert "health_packet_mismatch.exchange(true)" in body
+    assert "LOGE(" in body
     # a COMMS error must not be mistaken for a version mismatch
     assert "if (err < 0) {\n    // comms error" in src
 
   def test_connect_refuses_a_mismatched_panda_but_not_a_flaky_one(self):
     src = (self.PANDAD / "pandad.cc").read_text()
-    assert "if (panda->health_packet_mismatch) {" in src
+    assert "if (is_supported && panda->health_packet_mismatch) {" in src
     assert "throw std::runtime_error(\"Panda health packet layout mismatch" in src
+
+  def test_a_short_read_does_not_take_the_whole_car_down(self):
+    """The Raven's SECOND panda is a deprecated device pandad.py flashes from a checked-in
+    prebuilt (or skips), so it can legitimately answer 0xd2 with an older, shorter health_t.
+    get_state() must NOT return nullopt for it -- that stops pandaStates and the heartbeat for the
+    WHOLE car. The refusal belongs in connect(), gated on `is_supported` (the same gate the
+    firmware-signature check uses), so no panda can be refused that is not already refusable.
+    (Fable review 2026-09-05.)"""
+    src = (self.PANDAD / "panda.cc").read_text()
+    body = src.split("if (err != (int)sizeof(health)) {")[1].split("return std::make_optional(health);")[0]
+    assert "return std::nullopt;" not in body, "a short read must not kill pandaStates for every panda"
+    assert "health_packet_mismatch.exchange(true)" in body, "log once, not every 100 ms"
+
+  def test_the_disengage_reason_is_published(self):
+    src = (self.PANDAD / "pandad.cc").read_text()
+    assert "ps.setMadsDisengageReason(health.mads_disengage_reason_pkt);" in src

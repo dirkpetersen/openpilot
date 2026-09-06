@@ -117,15 +117,24 @@ std::optional<health_t> Panda::get_state() {
   // panda is flashed separately from this code, so "new openpilot, old panda" WILL happen. Both
   // transports return the number of bytes the panda actually sent (libusb_control_transfer; the
   // SPI response header's rx_data_len), and the firmware always answers 0xd2 with sizeof(health_t)
-  // of ITS build. A short read therefore means the flashed firmware predates a field added here --
-  // in which case `health` would silently keep the zero-initialised tail and openpilot would read
-  // a fabricated `false` for it. Refuse instead: no pandaStates are published and no heartbeat is
-  // sent, so the car cannot engage and the panda falls back to SILENT. Loud, and fail-safe.
+  // of ITS build. A short read therefore means the flashed firmware predates a field added here,
+  // and `health` keeps the zero-initialised tail -- a FABRICATED value for the new fields.
+  //
+  // Flagged, logged once, and still returned -- the refusal is made in connect(), and ONLY for a
+  // panda this openpilot actually flashes. It must not be made here: the Tesla Raven runs a SECOND,
+  // DEPRECATED panda that pandad.py flashes from a checked-in prebuilt binary (F4), or skips
+  // entirely, so that panda can legitimately run an older health_t forever. Returning nullopt for
+  // it would stop pandaStates and the heartbeat for the WHOLE car -- taking the Raven off the road
+  // over a field only the car's own panda is ever read for. The zeroed tail is the fail-safe value
+  // in both cases ("lateral not permitted", "no disengage reason"), and that panda sits in
+  // SILENT/NO_OUTPUT, which selfdrived's IGNORED_SAFETY_MODES already excludes.
+  // (Fable review 2026-09-05 -- the earlier version returned nullopt here and would have
+  // crash-looped pandad on the Raven.)
   if (err != (int)sizeof(health)) {
-    health_packet_mismatch = true;
-    LOGE("panda health packet size mismatch: panda sent %d bytes, this build expects %d. "
-         "The flashed firmware does not match this openpilot -- reflash the panda.", err, (int)sizeof(health));
-    return std::nullopt;
+    if (!health_packet_mismatch.exchange(true)) {
+      LOGE("panda %s health packet size mismatch: panda sent %d bytes, this build expects %d. "
+           "Fields past byte %d are NOT from this panda.", hw_serial().c_str(), err, (int)sizeof(health), err);
+    }
   }
   return std::make_optional(health);
 }

@@ -78,17 +78,22 @@ Panda *connect(std::string serial="", uint32_t index=0) {
     throw std::runtime_error("Panda firmware out of date. Run pandad.py to update.");
   }
 
-  // madsheartbeat2pnw: one-shot, explicit diagnosis of a health-packet LAYOUT mismatch (the
-  // flashed firmware is not this revision). The firmware-signature check above already catches
-  // this on a normally built device, but it is skippable (BOARDD_SKIP_FW_CHECK) and does not apply
-  // to unsupported hw, and get_state()'s per-cycle rejection alone would only ever surface as
-  // "Failed to get ignition_opt". Read once so the failure names its cause.
+  // madsheartbeat2pnw: refuse a panda whose health_t layout is not this build's -- the flashed
+  // firmware predates a field openpilot now reads, and the missing bytes would be fabricated.
   //
-  // Deliberately NOT retried and NOT thrown on a comms error: health_packet_mismatch is set only
-  // by a SHORT READ, which is definitive. A transient SPI/USB failure leaves it false and this is
-  // a no-op, so this cannot add a new way for a healthy car to refuse to start.
+  // Gated on `is_supported`, the SAME gate as the firmware-signature check above, so the set of
+  // pandas this can refuse is EXACTLY the set already refusable today. That is the point: the
+  // Tesla Raven's SECOND panda is a deprecated device pandad.py flashes from a checked-in prebuilt
+  // (selfdrive/pandad/fw/panda_f4.bin.signed, NOT rebuilt from panda/) or skips outright, so it can
+  // legitimately run an older health_t. Refusing it would crash-loop pandad and take the Raven off
+  // the road over a Ford-only feature. get_state() logs the mismatch for that panda instead.
+  //
+  // Deliberately NOT retried and NOT thrown on a comms error: health_packet_mismatch is set only by
+  // a SHORT READ, which is definitive (SPI checks the response checksum; USB returns the real
+  // transferred length). A transient failure leaves it false and this is a no-op, so this adds no
+  // new way for a healthy car to refuse to start. (Fable review 2026-09-05.)
   panda->get_state();
-  if (panda->health_packet_mismatch) {
+  if (is_supported && panda->health_packet_mismatch) {
     throw std::runtime_error("Panda health packet layout mismatch (see the preceding log line). "
                              "The flashed firmware does not match this openpilot -- reflash the panda.");
   }
@@ -179,6 +184,9 @@ void fill_panda_state(cereal::PandaState::Builder &ps, cereal::PandaState::Panda
   // madsheartbeat2pnw: the panda's own lateral authority, so selfdrived can detect a revoke
   // it did not ask for. Equals controlsAllowed on any panda without the MADS safety build.
   ps.setControlsAllowedLateral((bool)(health.controls_allowed_lateral_pkt));
+  // madsheartbeat2pnw: WHY the panda last took lateral down (opendbc DisengageReason).
+  // Diagnostic only -- nothing reads it for control.
+  ps.setMadsDisengageReason(health.mads_disengage_reason_pkt);
 }
 
 void fill_panda_can_state(cereal::PandaState::PandaCanState::Builder &cs, const can_health_t &can_health) {

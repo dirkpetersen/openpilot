@@ -964,13 +964,28 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   # madsheartbeat2pnw: the panda revoked its parallel lateral authority while MADS was still
   # commanding lateral (its heartbeat_engaged_mads watchdog fired, an rx message went invalid, ...).
+  #
   # IMMEDIATE_DISABLE is what makes mads_pnw.has_blocking_event() end the lateral-only state, so
   # openpilot stops steering into a panda that is already blocking it. It can only be raised while
   # openpilot's own engagement is already gone (see selfdrived.data_sample), so it cannot disengage
   # a normally-engaged car.
+  #
+  # ET.PERMANENT is what makes it REACH THE DRIVER, and it is load-bearing, not decoration. In the
+  # lateral-only state openpilot's own state machine sits in `disabled`, whose current_alert_types
+  # is [ET.PERMANENT] ONLY -- so an IMMEDIATE_DISABLE/NO_ENTRY-only event would produce no text and
+  # no sound at all, and the driver's only cue that the truck stopped steering would be the
+  # "Steering only" banner quietly vanishing. That is exactly the silent failure this feature
+  # exists to remove. Duration 4 s because the event fires for a SINGLE frame: it ends the
+  # lateral-only state, which resets the counter, which stops it being raised.
+  # (Fable review 2026-09-05.)
   EventName.madsControlsMismatchLateral: {
     ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("Controls Mismatch: Lateral"),
     ET.NO_ENTRY: NoEntryAlert("Controls Mismatch: Lateral"),
+    ET.PERMANENT: Alert(
+      "TAKE CONTROL IMMEDIATELY",
+      "Steering stopped - panda revoked lateral control",
+      AlertStatus.critical, AlertSize.full,
+      Priority.HIGHEST, VisualAlert.steerRequired, AudibleAlert.warningImmediate, 4.),
   },
 
   # Sometimes the USB stack on the device can get into a bad state

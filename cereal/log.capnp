@@ -602,6 +602,9 @@ struct PandaState @0xa7649e2575e4591e {
   # (controls_allowed || controls_allowed_lateral) from board/health.h. Equals
   # controlsAllowed on any panda without the MADS safety build.
   controlsAllowedLateral @38 :Bool;
+  # madsheartbeat2pnw: the DisengageReason that last took lateral authority down
+  # (opendbc/safety/pnw/mads_declarations.h). Diagnostic only; 0 = none.
+  madsDisengageReason @39 :UInt8;
 
   # can health
   canState0 @29 :PandaCanState;
