@@ -109,7 +109,25 @@ void Panda::set_ir_pwr(uint16_t ir_pwr) {
 std::optional<health_t> Panda::get_state() {
   health_t health {0};
   int err = handle->control_read(0xd2, 0, 0, (unsigned char*)&health, sizeof(health));
-  return err >= 0 ? std::make_optional(health) : std::nullopt;
+  if (err < 0) {
+    // comms error -- unchanged handling, the caller retries
+    return std::nullopt;
+  }
+  // madsheartbeat2pnw: health_t is a VERSIONED WIRE STRUCT shared with the panda firmware, and the
+  // panda is flashed separately from this code, so "new openpilot, old panda" WILL happen. Both
+  // transports return the number of bytes the panda actually sent (libusb_control_transfer; the
+  // SPI response header's rx_data_len), and the firmware always answers 0xd2 with sizeof(health_t)
+  // of ITS build. A short read therefore means the flashed firmware predates a field added here --
+  // in which case `health` would silently keep the zero-initialised tail and openpilot would read
+  // a fabricated `false` for it. Refuse instead: no pandaStates are published and no heartbeat is
+  // sent, so the car cannot engage and the panda falls back to SILENT. Loud, and fail-safe.
+  if (err != (int)sizeof(health)) {
+    health_packet_mismatch = true;
+    LOGE("panda health packet size mismatch: panda sent %d bytes, this build expects %d. "
+         "The flashed firmware does not match this openpilot -- reflash the panda.", err, (int)sizeof(health));
+    return std::nullopt;
+  }
+  return std::make_optional(health);
 }
 
 std::optional<can_health_t> Panda::get_can_state(uint16_t can_number) {
@@ -156,8 +174,11 @@ void Panda::enable_deepsleep() {
   handle->control_write(0xfb, 0, 0);
 }
 
-void Panda::send_heartbeat(bool engaged) {
-  handle->control_write(0xf3, engaged, 0);
+void Panda::send_heartbeat(bool engaged, bool engaged_mads) {
+  // madsheartbeat2pnw: param2 is the LATERAL half -- "openpilot still intends lateral authority".
+  // board/main.c revokes controls_allowed_lateral after 3 s of it reading 0 while the latch is up.
+  // A panda flashed with a firmware that predates this simply ignores param2.
+  handle->control_write(0xf3, engaged, engaged_mads);
 }
 
 void Panda::set_can_speed_kbps(uint16_t bus, uint16_t speed) {

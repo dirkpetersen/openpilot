@@ -5,10 +5,13 @@ status: current        # current | drifted | superseded | unreviewed
 
 # MADS2PNW — "lateral survives a brake press"
 
-**Branches:** `mads2pnw` (panda safety C + the toggle) and `madsop2pnw` (the openpilot-side
-engagement state machine) in `dirkpetersen/pnw-pilot`; `mads2pnw` in `dirkpetersen/pnw-opendbc`.
-**Status: BUILT, REVIEWED, INERT.** It does nothing on the car until the panda is reflashed.
-Do not merge to `3devpnw`/`3testpnw` yet.
+**Branches:** `mads2pnw` (panda safety C + the toggle), `madsop2pnw` (the openpilot-side
+engagement state machine) and `madsheartbeat2pnw` (the lateral watchdog + the health-packet field)
+in `dirkpetersen/pnw-pilot`; `mads2pnw` + `madsheartbeat2pnw` in `dirkpetersen/pnw-opendbc`;
+`madsheartbeat2pnw` in `dirkpetersen/pnw-panda`.
+**Status: BUILT, REVIEWED, INERT. All three pre-flash blockers are now closed in code.** It does
+nothing on the car until the panda is reflashed. **Do not merge to `3devpnw`/`3testpnw`** — merging
+IS the flash, see the flash-procedure section.
 
 ## The problem
 
@@ -136,7 +139,7 @@ exists because suppressing openpilot's *own* disengage against a panda that stil
 (see below), so that state is unreachable. `PandaMadsSafety` guards the converse — sending MADS
 bits to a panda that cannot honour them.
 
-## ⚠️ What is NOT done — read before planning the flash
+## ⚠️ The three pre-flash blockers — all now CLOSED in code (the flash itself is not)
 
 ### 1. ~~The openpilot-side lateral engagement state machine is NOT ported~~ — DONE, on `madsop2pnw`
 See *The openpilot side* below. Items 2 and 3 remain, and item 2 is still a hard pre-flash blocker.
@@ -289,8 +292,9 @@ queued. `Controls.lat_authorised()` is the single place that reads it and falls 
 | `selfdrive/test/process_replay/process_replay.py` | `madsState` added to dmonitoringd's pubs |
 | `selfdrive/selfdrived/tests/test_mads_pnw.py` | new — 64 tests |
 
-### 2. No lateral watchdog (`heartbeat_engaged_mads`) — HARD BLOCKER for flashing
-`panda/board/main.c` has a 3-second watchdog for `controls_allowed`:
+### 2. ~~No lateral watchdog (`heartbeat_engaged_mads`)~~ — DONE, on `madsheartbeat2pnw`
+
+`panda/board/main.c` has a 3 s watchdog for `controls_allowed`:
 
 ```c
 if (controls_allowed && !heartbeat_engaged) {
@@ -299,58 +303,147 @@ if (controls_allowed && !heartbeat_engaged) {
 } else { heartbeat_engaged_mismatches = 0U; }
 ```
 
-There is **no lateral equivalent**. Upstream's is fed by `heartbeat_engaged_mads`, which the panda
-receives in heartbeat cmd `0xf3` **param2** — plumbing this tree's panda does not have. Before any
-flash, add to `pnw-panda` (`master-pnw` → a `mads2pnw` branch):
+There is now a **lateral twin**, restored verbatim from upstream:
 
-```c
-/* board/main_comms.h, case 0xf3: */   heartbeat_engaged_mads = (req->param2 == 1U);
-/* board/main.c, in the 1 Hz block:  */ mads_heartbeat_engaged_check();
-```
+| repo | branch | what |
+|---|---|---|
+| `pnw-opendbc` | `madsheartbeat2pnw` | `heartbeat_engaged_mads` + `heartbeat_engaged_mads_mismatches` globals and `mads_heartbeat_engaged_check()` in `opendbc/safety/pnw/mads.h`; the externs, the `MADS_DISENGAGE_REASON_HEARTBEAT_ENGAGED_MISMATCH = 32` reason, and `SAFETY_UNUSED` entries for the MISRA TU |
+| `pnw-panda` | `madsheartbeat2pnw` | `case 0xf3:` reads `heartbeat_engaged_mads = (req->param2 == 1U)`; the 1 Hz block calls `mads_heartbeat_engaged_check()`; the heartbeat-lost block clears the flag |
+| `pnw-pilot` | `madsheartbeat2pnw` | `Panda::send_heartbeat(engaged, engaged_mads)` → `control_write(0xf3, engaged, engaged_mads)`; `pandad` subscribes `madsState` and sends `available && enabled` |
 
-plus `heartbeat_engaged_mads` / `heartbeat_engaged_mads_mismatches` globals and
-`mads_heartbeat_engaged_check()` restored in `opendbc/safety/pnw/mads.h` (it was removed here
-rather than shipped as unused code that trips MISRA 8.7 — the exact upstream body is in
-`sunny/bluepilot/opendbc_repo/opendbc/safety/sunnypilot/mads.h`). pandad must then send a real
-"openpilot still wants lateral" flag. That flag now exists — `madsState.active` (or
-`madsState.enabled`) is exactly it, and `pandad` is where it must be plumbed into the `0xf3`
-heartbeat's `param2`. **The flash is still blocked on this: without the watchdog the panda has no
-way to notice that openpilot died while lateral authority was latched.**
+**What it is for, precisely.** *Not* "openpilot died" — that is already covered: no `0xf3` at all →
+`heartbeat_counter` climbs → the panda drops to `SAFETY_SILENT` → `set_safety_hooks` →
+`mads_set_system_state(false,…)` → `m_mads_state_init()` → `controls_allowed_lateral = false`. The
+watchdog covers openpilot **still talking but no longer intending lateral** (selfdrived restarted,
+`madsState` went stale/invalid, MADS turned itself off): within 3 s the panda takes lateral back.
 
-### 3. Latch state is invisible ON THE PANDA SIDE
-`madsop2pnw` publishes openpilot's view (`madsState`), but nothing publishes the panda's
-`controls_allowed_lateral` — no health field, no `PandaState`, no `ces_events`. Until it does,
-there is **no lateral equivalent of `mismatch_counter`**: openpilot cannot tell that the panda
-dropped lateral authority while it kept commanding it (the failure would be silent — the panda
-blocks the tx and the truck simply stops steering). sunnypilot's `mads.py` has exactly this check
-(`lateral_mismatch_counter` over `pandaStates[].controlsAllowedLateral`); it is **not ported here
-because the field does not exist in this tree's panda**. Add it with item 2.
+**It can only ever REVOKE.** The only authority write is `mads_exit_controls()`, which can only
+clear; the counter only advances while the latch is *already* up; and `heartbeat_engaged_mads`
+initialises **false**, so a panda that never hears from a MADS-aware openpilot revokes and stays
+revoked. `pandad` sends `false` for every failure mode (`madsState` missing, stale, invalid, or
+simply unavailable). **Missing means revoke.**
+
+`madsState.**enabled**` is sent, not `.active` — `.active` additionally goes false in
+`preEnabled`/`softDisabling`, where the panda's latch legitimately stays up, and sending `.active`
+there would revoke the latch a few seconds into an ordinary engage. `enabled` is the exact mirror
+of `controls_allowed_lateral` (and is what upstream sends). `.active ⊆ .enabled` always, so this is
+the weaker, correct claim.
+
+### 3. ~~Latch state is invisible ON THE PANDA SIDE~~ — DONE, on `madsheartbeat2pnw`
+
+`health_t` gains `uint8_t controls_allowed_lateral_pkt`, filled with
+`(controls_allowed || controls_allowed_lateral)` — exactly the expression every lateral tx gate in
+`opendbc/safety/lateral.h` evaluates. It reaches openpilot as `PandaState.controlsAllowedLateral`
+(`log.capnp @38`), and `selfdrived` counts a `lateral_mismatch_counter` over it, mirroring
+`mismatch_counter`, raising `madsControlsMismatchLateral` (`ET.IMMEDIATE_DISABLE`) after 2 s.
+Because that event carries a disable type, `mads_pnw.has_blocking_event()` ends the lateral-only
+state, so openpilot stops steering into a panda that is already blocking it — instead of the
+silent no-steer this used to be.
+
+The counter is pinned to zero unless MADS is **available AND holding lateral alone AND openpilot
+itself is disengaged**, so it can never disengage a normally-engaged car. On any panda without the
+MADS safety build `controls_allowed_lateral` is permanently false and the field simply equals
+`controlsAllowed`.
+
+#### The health packet is a versioned wire struct — what happens on a mismatch
+
+`HEALTH_PACKET_VERSION` is a sha256 over `panda/board/health.h`, computed identically by
+`panda/python/constants.py` and `panda/board/SConscript`, so **it bumps itself**:
+`0xf63f9de2` → `0x26b47f92`. There is no hand-maintained constant to forget. The struct grew
+59 → **60 bytes**, still under `USBPACKET_MAX_SIZE` (64), so `get_health_pkt`'s
+`COMPILE_TIME_ASSERT` holds.
+
+* **NEW openpilot + OLD panda** (the one that WILL happen, because the panda is flashed
+  separately):
+  * `pandad.py` at boot compares the flashed firmware signature to the built binary and
+    **reflashes** — so on a normal device this state is transient.
+  * If it is not reflashed, `pandad`'s `connect()` already throws *"Panda firmware out of date"*.
+  * If even that is skipped (`BOARDD_SKIP_FW_CHECK`), `Panda::get_state()` now rejects the short
+    `0xd2` read (`err != sizeof(health)`) with a named `LOGE` instead of keeping the
+    zero-initialised tail — which would have been a fabricated `controlsAllowedLateral = false`.
+    `connect()` additionally reads once at startup and throws a message that names the cause —
+    gated on a `health_packet_mismatch` flag that only a **short read** sets, so a transient
+    SPI/USB failure can never be misdiagnosed as a version mismatch and this adds no new way for a
+    healthy car to refuse to start. No `pandaStates`, no heartbeat → the car cannot engage and the
+    panda falls back to `SILENT`.
+  * pypanda (`@ensure_health_packet_version`) raises *"health packet version mismatch: panda's
+    firmware vX, library vY. Reflash panda."*
+* **NEW panda + OLD openpilot**: the old build requests the shorter struct; libusb/SPI truncate to
+  the requested length, so the new trailing byte is simply never read. Old pypanda still refuses on
+  the version hash, and the boot path reflashes the panda back down. Harmless.
+* **Never silent, in either direction.** The failure is always a refusal, never a mis-parse.
+
 
 ## The panda flash procedure (owner's call, with the cars present — NOT done here)
 
-**Do not flash before items 1 and 2 above are done.** When they are:
+Blockers 1–3 above are now closed in code. **The flash itself is still the owner's call**, because
+the same device is moved between a single-panda Lightning and a **dual-panda Raven**, and a
+mismatched matched-set has previously left the Raven's aux panda in DFU.
 
-1. **Repos and the matched set.** The panda firmware is built from **`pnw-panda`** together with
-   **`pnw-opendbc`** (the safety C lives in opendbc, the board code in panda). They are a
-   *matched set*: `panda/board/` and `opendbc/safety/` share the `CANPacket_t` layout, and panda
-   embeds `CAN_PACKET_VERSION_HASH` computed over it. A panda flashed from one pair and driven by
-   an openpilot pinned to a different pair will refuse to talk (or, worse, mis-frame). So:
-   * push `pnw-opendbc mads2pnw` and `pnw-panda mads2pnw`,
-   * bump **both** submodule pins in the same `pnw-pilot` commit,
-   * build panda from *that* checkout's submodules only — never mix a locally built panda with a
-     differently pinned opendbc.
-2. **Build + flash** from the device (this fork's normal path), with the car **disengaged**:
-   `cd /data/openpilot/panda && scons -u -j4 && python board/flash.py`. Then verify
-   `pandaState.pandaType`, no `relayMalfunction`, and that the panda's reported
-   `alternativeExperience` matches `CarParams.alternativeExperience` (`selfdrived.py` raises
-   `controlsMismatch` if not).
-3. **Only then** set `PandaMadsSafety=1` and reboot; the "Disengage on brake" toggle un-greys.
-4. **Rollback** = re-pin the submodules to the previous SHAs (`951c7725` opendbc / `56920ec6`
-   panda as of this writing), rebuild, reflash, and set `PandaMadsSafety=0`. Keep a known-good
-   `panda.bin.signed` on the device first — `pandad` reflashes to whatever `FW_PATH` holds, so a
-   half-flashed panda recovers by putting the old signed binary back and rebooting. The dual-panda
-   flash blocker documented in `XNOR2BP.md` is the reason this is the owner's call and not a
-   background task.
+### ⚠️ Merging this to a channel IS the flash
+
+`pandad.py` compares the flashed panda's firmware signature against the binary built from the
+checked-out `panda/` submodule at **every boot**, and reflashes on a mismatch. So promoting these
+branches to `3devpnw`/`3testpnw` does not "stage" a flash — the next boot performs it,
+unattended, on whichever car the device is plugged into. That is why these stay on feature
+branches until the owner is present.
+
+### Pin-bump order (the matched set)
+
+`panda/board/` and `opendbc/safety/` share `CANPacket_t`, and the firmware embeds
+`CAN_PACKET_VERSION_HASH` computed over it; `health_t` now carries its own
+`HEALTH_PACKET_VERSION`. A panda flashed from one pair and driven by an openpilot pinned to a
+different pair refuses to talk. Order matters:
+
+1. **Push the companions first**, in either order — nothing depends on them yet:
+   * `pnw-opendbc` `madsheartbeat2pnw` → merge into `master-pnw` (or the SHA the channel pins)
+   * `pnw-panda` `madsheartbeat2pnw` → merge into `master-pnw`
+2. **Bump BOTH submodule pins in ONE `pnw-pilot` commit.** Never bump one and not the other: an
+   opendbc with `mads_heartbeat_engaged_check()` and a panda that never calls it is a silent
+   loss of the watchdog; a panda that calls it against an opendbc without it does not link.
+3. Only then merge that `pnw-pilot` commit to a channel.
+
+Note the current channel pins are **not** `master-pnw` on either companion (see
+`[[deployed-pin-not-master-pnw]]`) — check what `3devpnw` actually pins before merging, and base
+the bump on that, not on the local branch tips.
+
+### Flash + verify (car disengaged; disengaged is the ONLY condition)
+
+```bash
+cd /data/openpilot/panda && scons -u -j4 && python board/flash.py
+```
+
+Then verify, in order:
+
+1. `pandaState.pandaType` is `tres` (and both pandas are present on the Raven).
+2. No `relayMalfunction`, no `controlsMismatch`.
+3. The panda's reported `alternativeExperience` matches `CarParams.alternativeExperience`.
+4. **New:** `pandaState.controlsAllowedLateral` tracks `pandaState.controlsAllowed` before
+   `PandaMadsSafety` is set. If it is stuck false while `controlsAllowed` is true, the flashed
+   firmware is not this build.
+5. No `panda health packet size mismatch` in the pandad log.
+6. **Only then** set `PandaMadsSafety=1` and reboot; the "Disengage on brake" toggle un-greys.
+
+### Rollback
+
+1. Re-pin **both** submodules to the SHAs the channel previously carried (`e18d40cf` opendbc /
+   `56920ec6` panda as of this writing) in one commit, rebuild, reflash.
+2. Set `PandaMadsSafety=0`.
+3. Keep a known-good `panda.bin.signed` on the device **before** flashing — `pandad` reflashes to
+   whatever `FW_PATH` holds, so a half-flashed panda recovers by putting the old signed binary
+   back and rebooting.
+4. The dual-panda flash blocker in `XNOR2BP.md` is why this is the owner's call.
+
+### What is still UNVERIFIED until someone flashes
+
+* The STM32 firmware has **never been compiled** — no `arm-none-eabi-gcc` on the dev host. The
+  three inserted expressions were compiled and linked against the real opendbc safety headers on
+  x86 as a stand-in, but the real build is unproven.
+* The 0xf3 `param2` round trip (openpilot → USB/SPI → `heartbeat_engaged_mads`) has no test that
+  crosses the wire; each half is tested separately.
+* `controls_allowed_lateral_pkt` being filled correctly by real firmware.
+* Everything about the dual-panda Raven pairing after a flash.
+
 
 ## Test evidence
 
@@ -364,3 +457,36 @@ because the field does not exist in this tree's panda**. Add it with item 2.
 * **Mutation testing: 22 mutations, 0 survivors** (see the branch's commit message for the list),
   including two anti-weakening mutants — removing the brake clear of `controls_allowed`, and
   making the reset latch ignore authority entirely — both killed loudly.
+
+## Test evidence — `madsheartbeat2pnw` (2026-09-05)
+
+* **Panda safety suite, serial** (`-o addopts=""`): **3094 passed**, 0 failed. The one failure in
+  the directory, `misra/test_mutation.py::test_misra_mutation`, is **identical at the parent
+  commit** — it asserts the clean tree passes MISRA, and this tree has 43 pre-existing violations.
+* **MISRA/cppcheck: 43 violations, byte-identical to the parent commit.** Zero new.
+* **openpilot side:** `selfdrive/selfdrived/tests/` + `test_mads_alternative_experience.py` +
+  `test_car_interfaces.py` — **357 passed**. `test_mads_pnw.py` alone is now **81 tests** (64 + 17
+  new). `ruff check` clean. (`test_alerts.py` does not collect on the dev host — missing acados
+  `c_generated_code`; `test_cruise_speed.py` likewise.)
+* **`pandad` C++:** `panda.cc` and `pandad.cc` type-check clean (`g++ -fsyntax-only -Wall -Wextra`)
+  against the **regenerated** cereal headers and the real `panda/board/health.h`; no new warnings.
+  A full link was not possible on this host (no `libusb-1.0` dev headers).
+* **Mutation testing, 31 mutations, ZERO survivors:**
+  * opendbc (13): threshold 3→4 and 3→2; counter never advances; counter never resets; latch guard
+    dropped; heartbeat sense inverted; **watchdog GRANTS instead of revoking**; **watchdog also
+    clears `controls_allowed`**; `heartbeat_engaged_mads` defaulting to `true`; watchdog reading
+    `controls_allowed` instead of the lateral latch; wrong disengage reason; mismatch counter not
+    re-inited; reason enum colliding with `LAG`.
+  * openpilot (18): counter never increments / never resets; `self.enabled` guard dropped;
+    `mads.available` guard dropped; `lateral_only` guard dropped; panda-permits test inverted;
+    silent pandas no longer ignored; event never raised; threshold 200 → 20000; event downgraded
+    from `IMMEDIATE_DISABLE` to a banner; `pandad` hardcoding the mads heartbeat true; `pandad`
+    ignoring `madsState` staleness; `pandad` not publishing the panda's authority; `param2`
+    hardcoded; a short health read silently accepted; `connect()` no longer refusing a
+    mismatched panda; the mismatch flag never set; a comms error misdiagnosed as a version
+    mismatch.
+  * One survivor was found and fixed rather than hidden: the C initializer
+    `bool heartbeat_engaged_mads = false;` was masked because the libsafety harness forced it
+    `true` in `init_tests()`. The harness no longer does that (a harness that lies about a
+    safety default hides exactly this), and the initializer is pinned by
+    `test_mads_heartbeat_default_is_revoke`.

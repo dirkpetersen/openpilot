@@ -962,6 +962,17 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.NO_ENTRY: NoEntryAlert("Controls Mismatch"),
   },
 
+  # madsheartbeat2pnw: the panda revoked its parallel lateral authority while MADS was still
+  # commanding lateral (its heartbeat_engaged_mads watchdog fired, an rx message went invalid, ...).
+  # IMMEDIATE_DISABLE is what makes mads_pnw.has_blocking_event() end the lateral-only state, so
+  # openpilot stops steering into a panda that is already blocking it. It can only be raised while
+  # openpilot's own engagement is already gone (see selfdrived.data_sample), so it cannot disengage
+  # a normally-engaged car.
+  EventName.madsControlsMismatchLateral: {
+    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("Controls Mismatch: Lateral"),
+    ET.NO_ENTRY: NoEntryAlert("Controls Mismatch: Lateral"),
+  },
+
   # Sometimes the USB stack on the device can get into a bad state
   # causing the connection to the panda to be lost
   EventName.usbError: {

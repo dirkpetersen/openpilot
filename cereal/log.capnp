@@ -91,6 +91,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     greenLight @99;  # greenlight2pnw: model released a held standstill with NO lead (green-light ding) — display/sound only
     leadDeparting @100;  # greenlead2pnw: stopped lead pulled away while we sit at a standstill — display/sound only
     madsLateralOnly @101;  # madsop2pnw: steering is live while openpilot's own engagement is gone — banner only, no control path
+    madsControlsMismatchLateral @102;  # madsheartbeat2pnw: the panda revoked lateral authority while MADS was still commanding it
     ldw @53;
     carUnrecognized @54;
     invalidLkasSetting @55;
@@ -597,6 +598,10 @@ struct PandaState @0xa7649e2575e4591e {
   sbu1Voltage @35 :Float32;
   sbu2Voltage @36 :Float32;
   soundOutputLevel @37 :UInt16;
+  # madsheartbeat2pnw: the panda's own answer to "is LATERAL tx permitted?", i.e.
+  # (controls_allowed || controls_allowed_lateral) from board/health.h. Equals
+  # controlsAllowed on any panda without the MADS safety build.
+  controlsAllowedLateral @38 :Bool;
 
   # can health
   canState0 @29 :PandaCanState;

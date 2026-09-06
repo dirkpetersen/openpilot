@@ -511,3 +511,189 @@ class TestNeverSuppresses:
     # openpilot itself is disengaged, which is exactly the lateral-only state.
     src = inspect.getsource(SelfdriveD.data_sample)
     assert "if not self.enabled:\n      self.mismatch_counter = 0" in src
+
+
+# ---------------------------------------------------------------------------------------------
+# madsheartbeat2pnw — the lateral mismatch detector
+# ---------------------------------------------------------------------------------------------
+
+class _FakePandaState:
+  def __init__(self, controls_allowed_lateral: bool, safety_model=car.CarParams.SafetyModel.ford):
+    self.controlsAllowedLateral = controls_allowed_lateral
+    self.controlsAllowed = controls_allowed_lateral
+    self.safetyModel = safety_model
+
+
+class _FakeSM:
+  """Just enough SubMaster for the tail of SelfdriveD.data_sample."""
+  def __init__(self, panda_states):
+    self._panda_states = panda_states
+    self.frame = 0
+
+  def update(self, _timeout):
+    self.frame += 1
+
+  def __getitem__(self, key):
+    assert key == 'pandaStates', key
+    return self._panda_states
+
+
+class _FakeSock:
+  def receive(self, non_blocking=False):
+    return None
+
+
+class _FakeMads:
+  def __init__(self, available: bool, lateral_only: bool):
+    self.available = available
+    self.lateral_only = lateral_only
+
+
+def _sd_for_mismatch(available: bool, lateral_only: bool, enabled: bool, panda_states):
+  """A real SelfdriveD with only the attributes data_sample's tail touches. No refactor, no
+  reimplementation: the code under test is the shipped method."""
+  sd = SelfdriveD.__new__(SelfdriveD)
+  sd.car_state_sock = _FakeSock()
+  sd.CS_prev = car.CarState.new_message().as_reader()
+  sd.sm = _FakeSM(panda_states)
+  sd.initialized = True
+  sd.enabled = enabled
+  sd.mads = _FakeMads(available, lateral_only)
+  sd.mismatch_counter = 0
+  sd.lateral_mismatch_counter = 0
+  return sd
+
+
+class TestLateralMismatchDetector:
+  """The panda now publishes its own lateral authority (PandaState.controlsAllowedLateral). This
+  is the detector that turns a panda-side revoke from a SILENT no-steer into an alert."""
+
+  def test_counter_climbs_while_the_panda_refuses_lateral(self):
+    sd = _sd_for_mismatch(available=True, lateral_only=True, enabled=False,
+                          panda_states=[_FakePandaState(False)])
+    for expected in range(1, 6):
+      sd.data_sample()
+      assert sd.lateral_mismatch_counter == expected
+
+  def test_counter_stays_at_zero_while_the_panda_permits_lateral(self):
+    sd = _sd_for_mismatch(available=True, lateral_only=True, enabled=False,
+                          panda_states=[_FakePandaState(True)])
+    for _ in range(500):
+      sd.data_sample()
+    assert sd.lateral_mismatch_counter == 0
+
+  def test_counter_resets_when_the_panda_comes_back(self):
+    states = [_FakePandaState(False)]
+    sd = _sd_for_mismatch(available=True, lateral_only=True, enabled=False, panda_states=states)
+    for _ in range(10):
+      sd.data_sample()
+    assert sd.lateral_mismatch_counter == 10
+    states[0].controlsAllowedLateral = True
+    sd.data_sample()
+    # the panda agreeing again does NOT reset the counter -- only leaving the lateral-only state
+    # does, exactly like the longitudinal mismatch_counter above it. It simply stops climbing.
+    assert sd.lateral_mismatch_counter == 10
+
+  @pytest.mark.parametrize("available,lateral_only,enabled", [
+    (False, True, False),    # MADS not available -- the shipping default on every car
+    (True, False, False),    # not holding lateral alone
+    (True, True, True),      # openpilot itself is engaged: the longitudinal check already covers it
+    (False, False, True),
+  ])
+  def test_counter_is_pinned_to_zero_outside_lateral_only(self, available, lateral_only, enabled):
+    sd = _sd_for_mismatch(available, lateral_only, enabled, panda_states=[_FakePandaState(False)])
+    sd.lateral_mismatch_counter = 199  # a stale, nearly-saturated counter
+    for _ in range(50):
+      sd.data_sample()
+    assert sd.lateral_mismatch_counter == 0
+
+  def test_reengaging_cannot_carry_a_saturated_counter_into_an_enabled_frame(self):
+    """The `self.enabled` term. Both self.enabled and mads.lateral_only are one frame stale here,
+    so without it a re-engage could fire an IMMEDIATE_DISABLE at a car that is steering fine."""
+    sd = _sd_for_mismatch(available=True, lateral_only=True, enabled=False,
+                          panda_states=[_FakePandaState(False)])
+    for _ in range(250):
+      sd.data_sample()
+    assert sd.lateral_mismatch_counter >= 200
+    sd.enabled = True                      # openpilot re-engaged; mads.lateral_only still stale True
+    sd.data_sample()
+    assert sd.lateral_mismatch_counter == 0
+
+  def test_silent_pandas_are_ignored(self):
+    """Same exclusion as the longitudinal counter: a panda in a silent/noOutput safety mode is not
+    supposed to allow anything, so it must not be read as a revoke."""
+    silent = _FakePandaState(False, safety_model=car.CarParams.SafetyModel.silent)
+    sd = _sd_for_mismatch(available=True, lateral_only=True, enabled=False, panda_states=[silent])
+    for _ in range(50):
+      sd.data_sample()
+    assert sd.lateral_mismatch_counter == 0
+
+  def test_the_longitudinal_counter_is_untouched_by_all_of_this(self):
+    sd = _sd_for_mismatch(available=True, lateral_only=True, enabled=False,
+                          panda_states=[_FakePandaState(False)])
+    for _ in range(50):
+      sd.data_sample()
+    assert sd.mismatch_counter == 0, "MADS must never be able to move the longitudinal counter"
+
+  # ---- the event ---------------------------------------------------------------------------
+
+  def test_event_is_raised_at_two_seconds(self):
+    src = inspect.getsource(SelfdriveD.update_events)
+    assert "if self.lateral_mismatch_counter >= 200:\n      self.events.add(EventName.madsControlsMismatchLateral)" in src
+
+  def test_event_ends_the_lateral_only_state(self):
+    """THE consequence: openpilot must stop commanding lateral into a panda that is blocking it."""
+    mads = MadsPnw(MADS_ON)
+    engage(mads)
+    brake_release_cruise(mads)
+    assert mads.enabled and mads.lateral_only
+    mads.update(op_enabled=False, op_active=False, braking=False, cruise_enabled=False,
+                events=ev(EventName.pcmDisable, EventName.madsControlsMismatchLateral))
+    assert not mads.enabled
+    assert not mads.active
+
+  def test_event_carries_immediate_disable(self):
+    assert ET.IMMEDIATE_DISABLE in EVENTS[EventName.madsControlsMismatchLateral]
+    assert has_blocking_event(ev(EventName.madsControlsMismatchLateral))
+    assert EventName.madsControlsMismatchLateral not in MADS_TOLERATED_EVENTS
+
+
+class TestPandadHeartbeatPlumbing:
+  """The panda's lateral watchdog is fed by heartbeat 0xf3 param2. These pin the plumbing that
+  makes it a real signal rather than a constant -- the failure mode that made bluepilot's copy
+  dead code."""
+
+  PANDAD = pathlib.Path(__file__).parents[2] / "pandad"
+
+  def test_send_heartbeat_forwards_the_mads_flag_to_param2(self):
+    src = (self.PANDAD / "panda.cc").read_text()
+    assert "void Panda::send_heartbeat(bool engaged, bool engaged_mads) {" in src
+    assert "handle->control_write(0xf3, engaged, engaged_mads);" in src
+
+  def test_pandad_derives_the_flag_from_madsstate_and_not_a_constant(self):
+    src = (self.PANDAD / "pandad.cc").read_text()
+    assert '"madsState"' in src, "pandad must subscribe to madsState"
+    assert 'sm["madsState"].getMadsState().getEnabled()' in src
+    assert 'sm["madsState"].getMadsState().getAvailable()' in src
+    assert 'sm.allAliveAndValid({"madsState"})' in src, "a stale madsState must revoke, not grant"
+    assert "panda->send_heartbeat(engaged, engaged_mads);" in src
+
+  def test_pandad_publishes_the_pandas_lateral_authority(self):
+    src = (self.PANDAD / "pandad.cc").read_text()
+    assert "ps.setControlsAllowedLateral((bool)(health.controls_allowed_lateral_pkt));" in src
+
+  def test_health_packet_short_read_is_rejected_not_zero_filled(self):
+    """The versioned-wire-struct guard: an old panda answers 0xd2 with fewer bytes than this build
+    expects, and the zero-initialised tail would read as a fabricated `false`."""
+    src = (self.PANDAD / "panda.cc").read_text()
+    assert "if (err != (int)sizeof(health)) {" in src
+    body = src.split("if (err != (int)sizeof(health)) {")[1][:500]
+    assert "health_packet_mismatch = true;" in body
+    assert "return std::nullopt;" in body
+    # a COMMS error must not be mistaken for a version mismatch
+    assert "if (err < 0) {\n    // comms error" in src
+
+  def test_connect_refuses_a_mismatched_panda_but_not_a_flaky_one(self):
+    src = (self.PANDAD / "pandad.cc").read_text()
+    assert "if (panda->health_packet_mismatch) {" in src
+    assert "throw std::runtime_error(\"Panda health packet layout mismatch" in src
