@@ -481,9 +481,17 @@ Then verify, in order:
 
 ### What is still UNVERIFIED until someone flashes
 
-* The STM32 firmware has **never been compiled** — no `arm-none-eabi-gcc` on the dev host. The
-  three inserted expressions were compiled and linked against the real opendbc safety headers on
-  x86 as a stand-in, but the real build is unproven.
+* ~~The STM32 firmware has **never been compiled**~~ — **CLOSED 2026-09-06.** Built on the DEVICE,
+  which does have the toolchain at `/usr/local/venv/bin/arm-none-eabi-gcc` (a bare shell lacks that
+  PATH — the `DEVICE-TOOLBOX.md` trap; `command -v` in a plain ssh session reports it missing and
+  nearly produced a false "cannot be built" blocker). Standalone `panda/` build, scons exit 0,
+  `board/obj/panda_h7.bin.signed` produced at 82,560 bytes (was 82,456). The compile line confirms
+  the version claims independently:
+    * `HEALTH_PACKET_VERSION` `0xF63F9DE2` -> `0xD18411DB` — changed, as designed.
+    * `CAN_PACKET_VERSION_HASH` `0x75ABF276` -> `0x75ABF276` — **UNCHANGED**, so the matched-set
+      hash guarding the Raven's dual-panda pairing is not disturbed by this flash.
+  Note the full-tree `scons -u` does NOT work for this: it needs `rednose_repo` and the
+  `agnos19-compat` overlay on `PYTHONPATH`. Build `panda/` standalone.
 * The 0xf3 `param2` round trip (openpilot → USB/SPI → `heartbeat_engaged_mads`) has no test that
   crosses the wire; each half is tested separately.
 * `controls_allowed_lateral_pkt` being filled correctly by real firmware.
