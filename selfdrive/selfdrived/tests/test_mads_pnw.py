@@ -14,6 +14,7 @@ The load-bearing claims under test:
   5. every NON-brake loss of controls still drops lateral.
 """
 import ast
+import pathlib
 import importlib.util
 import inspect
 import textwrap
@@ -44,7 +45,7 @@ def _fn_ast(fn) -> ast.AST:
 def _method_ast(module: str, cls: str, method: str) -> ast.AST:
   """AST of one method, read from the file WITHOUT importing the module."""
   origin = importlib.util.find_spec(module).origin
-  for node in ast.walk(ast.parse(open(origin).read())):
+  for node in ast.walk(ast.parse(pathlib.Path(origin).read_text())):
     if isinstance(node, ast.ClassDef) and node.name == cls:
       for sub in node.body:
         if isinstance(sub, ast.FunctionDef) and sub.name == method:
