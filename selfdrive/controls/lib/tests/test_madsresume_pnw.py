@@ -230,15 +230,195 @@ def test_gate4_a_second_resume_needs_a_new_brake_to_lateral_only_cycle():
   assert len(d.offers) > n_first, "a new brake->lateral-only cycle must be allowed to resume"
 
 
-def test_gate4_re_braking_inside_the_window_aborts_rather_than_restarting_it():
+def test_double_brake_inside_the_optout_window_suppresses_the_resume():
+  """brakeretry2pnw: two presses inside DOUBLE_BRAKE_S is the driver saying "leave it off"."""
   d = Drive()
   d.tick(50)
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True, set_speed_ms=0.0)
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)   # released
+  # second press 0.4 s after the first -- well inside DOUBLE_BRAKE_S
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True, set_speed_ms=0.0)
   d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
   assert not d.fired()
-  assert "reBrake" in d.reasons("refuse")
+  assert "suppress" in d.phases(), d.records
+  assert "doubleBrake" in d.reasons("suppress")
+
+
+def test_a_later_brake_press_starts_a_FRESH_episode_and_can_resume():
+  """The 2026-09-06 defect: arming required a lateral_only RISING edge, so one miss killed the
+  feature for the rest of the drive. A second press -- outside the double-tap window -- must open a
+  genuinely new episode and be able to fire."""
+  d = Drive()
+  d.tick(50)                                                                 # capture
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  # first press, aborted immediately by the driver touching the accelerator
+  d.tick(20, brake_pressed=True, **hold)
+  d.tick(20, gas_pressed=True, **hold)
+  assert not d.fired()
+  assert "gas" in d.reasons("refuse")
+  # coast well past DOUBLE_BRAKE_S so the next press is a new intent, not a double-tap
+  d.tick(200, **hold)
+  # second press -> new arm -> release -> must resume
+  d.tick(20, brake_pressed=True, **hold)
+  d.tick(400, **hold)
+  assert d.fired(), f"a later brake press must get its own resume; records={d.records}"
+  assert d.offers[-1][2] == pytest.approx(SET)
+
+
+def test_a_freeway_set_speed_is_not_resumed_in_a_slow_town():
+  """Gemini finding A (BLOCK), reproduced exactly. Set 65 mph on the freeway, exit, drive several
+  minutes on MADS lateral through town, then brake and release at ~15 mph. A purely time-bounded
+  memory would hand back a 65 mph target on a residential street, where the lead gate protects
+  nothing because there is no lead."""
+  town = 7.0                                       # ~15 mph
+  d = Drive()
+  d.tick(50)                                       # freeway: capture SET (29 m/s, ~65 mph)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  # exit and drive in town on MADS lateral, long enough for the rolling max to age out
+  d.tick(int(1.5 * M.V_MAX_WINDOW_S / DT), v_ego=town, **hold)
+  d.tick(20, brake_pressed=True, v_ego=town, **hold)
+  d.tick(400, v_ego=town, **hold)
+  assert not d.fired(), f"must NOT resume to a freeway speed in town; records={d.records[-3:]}"
+  # both context guards independently refuse this; setFar is checked first
+  assert {"setFar", "staleContext"} & set(d.reasons("refuse")), d.records[-3:]
+
+
+def test_the_freeway_exit_then_yield_case_does_not_resume(): 
+  """Fable finding A1, its exact probe. `staleContext` is time-scoped, so within 60 s of freeway
+  speed it still permits this: brake 70 -> 25 mph down an off-ramp, release at the yield onto an
+  arterial, and RES would target 70 mph from 11 m/s with cross traffic and no lead to gate on.
+  Only the absolute delta cap bounds it."""
+  d = Drive()
+  d.tick(50)                                       # cruising at SET (29 m/s, ~65 mph)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  ramp = 11.0                                      # ~25 mph at the yield
+  d.tick(20, brake_pressed=True, v_ego=ramp, **hold)
+  d.tick(400, v_ego=ramp, **hold)
+  assert not d.fired(), f"must not resume 70 from 25 mph; records={d.records[-3:]}"
+  assert "setFar" in d.reasons("refuse"), d.records[-3:]
+
+
+def test_a_press_while_suppressed_still_leaves_a_record():
+  """Fable finding F/P5 (Rule 2). A suppressed press used to produce NO record at all -- a new
+  silent no-resume class, in a feature whose entire last investigation was diagnosing a no-resume."""
+  d = Drive()
+  d.tick(50)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, **hold)
+  d.tick(20, **hold)
+  d.tick(20, brake_pressed=True, **hold)           # double tap -> suppressed
+  assert d.b._suppressed
+  d.tick(200, **hold)
+  n = len(d.records)
+  d.tick(20, brake_pressed=True, **hold)           # a further press while suppressed
+  assert len(d.records) > n, "a suppressed press must not be silent"
+  assert "suppressed" in d.reasons("refuse"), d.records[-2:]
+
+
+def test_a_hard_brake_from_the_set_speed_still_resumes():
+  """The guard above must not cost the MAIN case: braking hard for traffic and releasing, well
+  below the set speed, with the set speed still a speed this drive has recently been doing."""
+  d = Drive()
+  d.tick(50)                                       # cruising at SET
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  slow = SET * 0.55                                # braked from ~65 mph down to ~36 mph
+  d.tick(20, brake_pressed=True, v_ego=slow, **hold)
+  d.tick(400, v_ego=slow, **hold)
+  assert d.fired(), f"the main case must still resume; records={d.records[-3:]}"
+  assert d.offers[-1][2] == pytest.approx(SET)
+
+
+def test_braking_right_after_our_resume_stops_it_instead_of_queueing_another():
+  """Gemini finding B. The driver's reflex against an unwanted resume is ONE firm brake. If that
+  press re-armed, releasing it would surge again -- an unwinnable fight. A brake inside
+  REJECT_AFTER_FIRE_S of our own fire latches the opt-out instead."""
+  d = normal_brake_and_resume()
+  assert d.fired(), "precondition: the reference drive resumes"
+  n_before = len(d.offers)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, **hold)          # driver brakes to reject it
+  d.tick(400, **hold)                              # ... and releases
+  assert len(d.offers) == n_before, f"must NOT resume again; records={d.records}"
+  assert "postResumeBrake" in d.reasons("suppress"), d.records
+
+
+def test_a_lingering_cruise_frame_does_not_wipe_the_optout():
+  """Fable finding C/P2 -- the one that would have reached the road. `_suppressed` was cleared on
+  the LEVEL of cruise_enabled, so a single frame where cruiseState.enabled still read True after
+  the driver's rejection brake wiped the opt-out and the truck resumed again. mads_pnw.py:235-237
+  says the PCM ordering is not guaranteed, so that frame is not hypothetical."""
+  d = normal_brake_and_resume()
+  assert d.fired(), "precondition: the reference drive resumes"
+  n_before = len(d.offers)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  # the rejection brake, with stock cruise still reading enabled for two frames (PCM lag)
+  d.tick(2, brake_pressed=True, lateral_only=True, op_enabled=False, cruise_enabled=True,
+         set_speed_ms=SET)
+  d.tick(18, brake_pressed=True, **hold)
+  d.tick(400, **hold)
+  assert d.b._suppressed, "the opt-out must survive a lingering cruise_enabled frame"
+  assert len(d.offers) == n_before, f"must not resume again; offers={d.offers}"
+
+
+def test_a_swallowed_chatter_repress_still_restarts_the_release_clock():
+  """Fable finding B/P1. A re-press inside BRAKE_DEBOUNCE_S is swallowed as chatter for EDGE
+  purposes, but it is still braking however long it is then held -- so it must restart the release
+  clock. Otherwise a fire lands moments after the real release, skipping the settle entirely."""
+  d = Drive()
+  d.tick(50)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, **hold)           # arm
+  d.tick(10, **hold)                               # released 100 ms (< BRAKE_DEBOUNCE_S)
+  d.tick(35, brake_pressed=True, **hold)           # re-press, HELD 350 ms
+  # the real release starts here; nothing may fire for at least RELEASE_MIN_S after it
+  t_release = d.t
+  d.tick(400, **hold)
+  if d.fired():
+    first = min(o[0] for o in d.offers)
+    assert first - t_release >= M.RELEASE_MIN_S - 1e-6, (
+      f"fired {first - t_release:.3f}s after the real release, inside RELEASE_MIN_S={M.RELEASE_MIN_S}")
+
+
+def test_pedal_chatter_is_not_a_double_tap():
+  """Gemini finding C. A bouncing pedal must not be read as the driver's deliberate opt-out --
+  that would silently kill the feature on a rough road."""
+  d = Drive()
+  d.tick(50)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, **hold)
+  d.tick(5, **hold)                                # 50 ms release -- bounce, under BRAKE_DEBOUNCE_S
+  d.tick(20, brake_pressed=True, **hold)
+  d.tick(400, **hold)
+  assert "suppress" not in d.phases(), f"chatter must not latch the opt-out; records={d.records}"
+  assert d.fired(), "and the resume must still happen"
+
+
+def test_regen_flicker_is_not_a_brake_press():
+  """Gemini finding C. Regen toggles as the driver modulates; each toggle must not read as a
+  discrete brake PRESS. The gaps here are deliberately longer than BRAKE_DEBOUNCE_S, so the
+  debounce cannot be what saves us -- if regen counted toward the edge, this regen rise would land
+  inside DOUBLE_BRAKE_S of the real brake press and latch the opt-out."""
+  d = Drive()
+  d.tick(50)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, **hold)           # the real press, at t
+  d.tick(20, **hold)                               # released for 0.2 s (> BRAKE_DEBOUNCE_S)
+  d.tick(20, regen_braking=True, **hold)           # regen rises 0.4 s after the press
+  d.tick(400, **hold)
+  assert "suppress" not in d.phases(), f"regen flicker must not latch the opt-out; records={d.records}"
+
+
+def test_double_brake_suppression_clears_when_the_driver_re_engages_cruise():
+  """"...until someone manually resumes or adjusts speeds" -- both engage stock cruise."""
+  d = Drive()
+  d.tick(50)
+  d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True, set_speed_ms=0.0)
+  d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True, set_speed_ms=0.0)
+  d.tick(100, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  assert d.b._suppressed, "double tap must latch the opt-out"
+  d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=True, set_speed_ms=SET)   # driver resumes
+  assert not d.b._suppressed, "manual re-engage must clear the opt-out"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -313,14 +493,28 @@ def test_gate6_a_stale_capture_refuses():
   assert "noSet" in d.reasons("refuse")
 
 
-def test_gate6_a_set_speed_below_fords_own_minimum_is_not_a_set_speed():
+def test_gate6_a_set_speed_below_the_sanity_floor_is_not_a_set_speed():
   d = Drive()
-  d.tick(50, set_speed_ms=5.0, v_ego=5.0)          # 5 m/s ~ 11 mph, below Ford's 20 mph ACC minimum
+  d.tick(50, set_speed_ms=3.0, v_ego=3.0)          # 3 m/s ~ 7 mph, below SET_MIN_MS
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True,
-         set_speed_ms=0.0, v_ego=5.0)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0, v_ego=5.0)
+         set_speed_ms=0.0, v_ego=3.0)
+  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0, v_ego=3.0)
   assert not d.fired()
   assert "noSet" in d.reasons("refuse")
+
+
+def test_gate6_a_real_15mph_set_speed_is_accepted():
+  """MEASURED on the truck 2026-09-06: stock ACC was engaged with set speeds of 15-19 mph (minimum
+  6.71 m/s, 34 ticks). The old 20 mph floor -- justified as "Ford's ACC will not hold a set speed
+  below 20 mph" -- was false for this car and silently refused the driver's real city speeds."""
+  low = 6.71                                        # 15 mph, the measured minimum
+  d = Drive()
+  d.tick(50, set_speed_ms=low, v_ego=low)
+  d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True,
+         set_speed_ms=0.0, v_ego=low)
+  d.tick(400, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0, v_ego=low)
+  assert d.fired(), f"a real 15 mph set speed must be resumable; records={d.records}"
+  assert d.offers[-1][2] == pytest.approx(low)
 
 
 def test_gate6_a_higher_reported_set_speed_blocks():
@@ -405,10 +599,10 @@ def test_gate7_gas_during_the_offer_withdraws_it():
 
 def test_low_speed_refuses():
   d = Drive()
-  d.tick(50, v_ego=6.0)
+  d.tick(50, v_ego=3.0)                             # ~7 mph, below V_EGO_MIN_MS
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True,
-         set_speed_ms=0.0, v_ego=6.0)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0, v_ego=6.0)
+         set_speed_ms=0.0, v_ego=3.0)
+  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0, v_ego=3.0)
   assert not d.fired()
 
 
@@ -451,11 +645,16 @@ def test_mads_becoming_available_mid_drive_while_lateral_only_does_not_arm():
   assert not d.fired() and d.records == []
 
 
-def test_capture_age_bound_covers_the_mads_brake_grace_window():
-  """SET_MAX_AGE_S is COUPLED to mads_pnw.MADS_BRAKE_GRACE_FRAMES: the brake may land that many
-  frames after the falling edge, and the capture has already stopped refreshing by then. This
-  module cannot import mads_pnw (that would drag in cereal), so the coupling is pinned by reading
-  the constant out of the source text. If someone widens the grace window, this fails."""
+def test_capture_age_bound_still_covers_the_mads_brake_grace_window():
+  """SET_MAX_AGE_S must still exceed mads_pnw.MADS_BRAKE_GRACE_FRAMES -- the brake may land that
+  many frames after the falling edge, with the capture already stopped. This module cannot import
+  mads_pnw (that would drag in cereal), so the coupling is pinned by reading the source text.
+
+  The old UPPER bound (grace + 0.5 s) is deliberately gone. It was sized against a hazard that is
+  handled one layer up -- a stalk CANCEL is not in MADS_TOLERATED_EVENTS, so `blocked` is True at
+  the falling edge and no episode is handed to this module at all -- and it was the direct cause of
+  the 2026-09-06 `noSet` cascade. What remains is a finite backstop, pinned here so the memory can
+  never become unbounded."""
   import pathlib
   import re
   src = (pathlib.Path(M.__file__).parent.parent.parent / "selfdrived" / "mads_pnw.py").read_text()
@@ -464,8 +663,59 @@ def test_capture_age_bound_covers_the_mads_brake_grace_window():
   grace_s = int(m.group(1)) * DT
   assert M.SET_MAX_AGE_S > grace_s, (
     f"SET_MAX_AGE_S={M.SET_MAX_AGE_S}s must exceed the MADS brake grace window ({grace_s}s) or a legitimate late-brake arm would refuse with noSet")
-  assert M.SET_MAX_AGE_S <= grace_s + 0.5, (
-    f"SET_MAX_AGE_S={M.SET_MAX_AGE_S}s exceeds grace {grace_s}s + margin; slack is time in which another cruise drop can be mistaken for this brake's")
+  assert 0.0 < M.SET_MAX_AGE_S <= 900.0, (
+    f"SET_MAX_AGE_S={M.SET_MAX_AGE_S}s must stay a FINITE backstop; an unbounded memory could resurface a set speed from a different road entirely")
+
+
+def test_the_capture_survives_the_cruise_off_gap_between_two_brakes():
+  """THE 2026-09-06 DEFECT, pinned. The capture only refreshes while stock cruise is engaged, and
+  a brake turns cruise off -- so after the first miss nothing refreshes it. With the old 0.75 s
+  bound, every later brake in the drive refused `noSet` (observed setAgeS 22.15 s, then -1.0).
+  The driver had to manually re-engage cruise to get the feature back at all."""
+  d = Drive()
+  d.tick(50)                                                                 # capture the set speed
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, **hold)                                     # first brake
+  d.tick(20, gas_pressed=True, **hold)                                       # driver overrides -> refuse
+  d.tick(3000, **hold)                                                       # 30 s with cruise OFF
+  d.tick(20, brake_pressed=True, **hold)                                     # brake again
+  d.tick(400, **hold)
+  arms = [r for r in d.records if r["phase"] == "arm"]
+  assert arms[-1]["setMs"] == pytest.approx(SET), (
+    f"the driver's set speed must survive the cruise-off gap; last arm={arms[-1]}")
+  assert "noSet" not in d.reasons("refuse"), d.records
+  assert d.fired()
+
+
+def test_the_capture_is_forgotten_when_the_acc_master_goes_off():
+  """The one thing that DOES invalidate the memory: the driver switching cruise off entirely."""
+  d = Drive()
+  d.tick(50)                                                                 # capture
+  d.tick(50, cruise_enabled=False, cruise_available=False)                   # master off
+  d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, cruise_available=False,
+         brake_pressed=True, set_speed_ms=0.0)
+  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, cruise_available=False,
+         set_speed_ms=0.0)
+  assert not d.fired()
+  # and it must name the SPECIFIC cause, not the noSet it caused one level down
+  assert "accOff" in d.reasons("refuse"), d.records
+
+
+def test_the_forgotten_capture_is_not_resurrected_when_the_master_comes_back():
+  """The distinguishing case for the clear itself. The test above cannot see it: with the master
+  still OFF at arm time, the abort chain reports `accOff` whether or not the memory was cleared, so
+  it passes either way (mutation survived, 2026-09-06). Here the master goes off and comes back ON
+  without cruise ever being re-engaged -- so `accOff` no longer applies, and the ONLY thing that can
+  refuse is the memory having been genuinely forgotten."""
+  d = Drive()
+  d.tick(50)                                                                 # capture SET
+  d.tick(50, cruise_enabled=False, cruise_available=False)                   # master OFF -> forget
+  d.tick(50, cruise_enabled=False, cruise_available=True)                    # master back ON, cruise idle
+  d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True,
+         set_speed_ms=0.0)
+  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  assert not d.fired(), "a set speed from before an explicit master-off must not be resurrected"
+  assert "noSet" in d.reasons("refuse"), d.records
 
 
 def test_a_late_brake_inside_the_mads_grace_window_still_captures_the_set_speed():
