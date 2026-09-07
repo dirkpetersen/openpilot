@@ -303,7 +303,16 @@ class SelfdriveD:
     # `CS.cruiseState.enabled and not CC.enabled` rule then sends cruiseControl.cancel -- so the
     # cancel needs no new code path of its own. Not latched when openpilot IS engaged: from Active
     # the truck's own button reaches Off cleanly and `cruiseState.available` already handles it.
-    if not self.enabled and any(be.pressed and be.type == ButtonType.mainCruise for be in CS.buttonEvents):
+    #
+    # REGRESSION FIX 2026-09-07: this condition was `not self.enabled`, which is ALSO true when
+    # openpilot is simply OFF. So pressing the button to turn cruise ON latched the block, openpilot
+    # refused to engage, and controlsd's cancel rule then cancelled the cruise the driver had just
+    # switched on -- "openpilot unavailable / cruise control turned off", every press, cruise
+    # unusable. The gate is the STEERING-ONLY state, which is the only state the feature was ever
+    # about; `lateral_only` names it exactly. Read from the previous frame (mads.update runs later
+    # in this tick), which is correct: the steering-only state persists across frames, and using
+    # this frame's value would need an ordering change for no benefit.
+    if self.mads.lateral_only and any(be.pressed and be.type == ButtonType.mainCruise for be in CS.buttonEvents):
       self.off_request_t = self.sm.frame * DT_CTRL
     if self.off_request_t and (self.sm.frame * DT_CTRL - self.off_request_t) <= OFF_REQUEST_HOLD_S:
       self.events.add(EventName.cruiseOffRequested)

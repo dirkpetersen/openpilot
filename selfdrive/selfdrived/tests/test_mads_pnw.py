@@ -865,6 +865,28 @@ class TestBrakeArrivesLate:
     m.update(False, False, False, False, self._no_ev(), False, False)      # CcStat -> Off
     assert not m.enabled and not m.lateral_only
 
+  def test_the_offrequest_latch_is_gated_on_steering_only_not_on_disengaged(self):
+    """REGRESSION 2026-09-07, found on the road within minutes of shipping.
+
+    The ACC ON/OFF latch in selfdrived was gated on `not self.enabled`, which is ALSO true when
+    openpilot is simply OFF. Pressing the button to turn cruise ON therefore latched the
+    cruiseOffRequested NO_ENTRY, openpilot refused to engage, and controlsd's
+    `cruiseState.enabled and not CC.enabled` rule cancelled the cruise the driver had just switched
+    on. Every press. Cruise unusable: "openpilot unavailable / cruise control turned off".
+
+    selfdrived needs cereal to import, which is not built on the dev host, so this pins the gate by
+    reading the source -- the same technique test_capture_age_bound uses for MADS_BRAKE_GRACE_FRAMES.
+    """
+    import pathlib
+    import re
+    src = (pathlib.Path(__file__).parent.parent / "selfdrived.py").read_text()
+    m = re.search(r"^\s*if (.+?) and any\(be\.pressed and be\.type == ButtonType\.mainCruise",
+                  src, re.M)
+    assert m, "could not find the ON/OFF press latch in selfdrived.py"
+    gate = m.group(1)
+    msg = f"ON/OFF latch must be gated on the STEERING-ONLY state, got `{gate}`"
+    assert "lateral_only" in gate, msg
+
   def test_cancel_button_without_brake_never_arms(self):
     """A cancel-button disengage has no brake: the window must expire and stay off."""
     from openpilot.selfdrive.selfdrived.mads_pnw import MADS_BRAKE_GRACE_FRAMES
