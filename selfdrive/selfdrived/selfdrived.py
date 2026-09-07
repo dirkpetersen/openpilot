@@ -38,6 +38,12 @@ TESTING_CLOSET = "TESTING_CLOSET" in os.environ
 # open (no new ces_events record) through any gap in the alert shorter than this; only a continuous
 # absence at least this long closes it and re-arms the next rising edge for a new record.
 STEER_SATURATED_HOLDOFF_S = 1.0
+# onebutton2pnw: how long an ACC ON/OFF press keeps openpilot out after the driver asked for
+# everything off. MEASURED 2026-09-07: the truck answers that press by engaging ~0.3 s later in
+# about half of the observed cases, so the hold only has to outlast that response and the cancel it
+# provokes. Deliberately short -- it is a refusal to engage, and a long one would feel like the
+# system had died rather than been switched off.
+OFF_REQUEST_HOLD_S = 3.0
 
 # locdebounce2pnw: consecutive livePose frames (20 Hz -> 3 = 150 ms) that must report inputsOK False
 # before locationdTemporaryError is raised. Measured 2026-08-20 over 522 segment-minutes: all 8
@@ -153,6 +159,9 @@ class SelfdriveD:
     self.mads_resume_offered = False        # is an offer currently published on /dev/shm?
     self.mads_resume_pub_t = 0.0
     self.mads_resume_fail = 0               # consecutive _mads_resume_step failures (loud, not silent)
+    # onebutton2pnw: monotonic time of the last ACC ON/OFF press made while openpilot was NOT fully
+    # engaged (i.e. the driver asking for everything off out of the steering-only state).
+    self.off_request_t = 0.0
     try:
       # Fable S2: gate on the SAME capability the executor gates on. `mads.available` alone is not
       # enough -- PnwVehicle.mads_resume additionally requires button_management (stock-ACC buttons
@@ -282,6 +291,22 @@ class SelfdriveD:
     # Don't add any more events while in dashcam mode
     if self.CP.passive:
       return
+
+    # onebutton2pnw: the ACC ON/OFF button, pressed while openpilot is NOT fully engaged, means
+    # "everything off" -- the driver's rule, and the state they are in after a brake left MADS
+    # steering with cruise in Standby. It is latched rather than acted on for one frame because the
+    # truck answers that press by ENGAGING roughly half the time (measured; see
+    # drives/2026-09-07/lightning-onoff-button/), ~0.3 s later. Without the latch openpilot would
+    # engage with it and bring everything straight back -- which is exactly the reported complaint.
+    #
+    # While the latch stands, the NO_ENTRY below keeps openpilot out, and controlsd's existing
+    # `CS.cruiseState.enabled and not CC.enabled` rule then sends cruiseControl.cancel -- so the
+    # cancel needs no new code path of its own. Not latched when openpilot IS engaged: from Active
+    # the truck's own button reaches Off cleanly and `cruiseState.available` already handles it.
+    if not self.enabled and any(be.pressed and be.type == ButtonType.mainCruise for be in CS.buttonEvents):
+      self.off_request_t = self.sm.frame * DT_CTRL
+    if self.off_request_t and (self.sm.frame * DT_CTRL - self.off_request_t) <= OFF_REQUEST_HOLD_S:
+      self.events.add(EventName.cruiseOffRequested)
 
     # Block resume if cruise never previously enabled
     resume_pressed = any(be.type in (ButtonType.accelCruise, ButtonType.resumeCruise) for be in CS.buttonEvents)
@@ -684,8 +709,10 @@ class SelfdriveD:
     # own disengage has ALREADY happened and is never edited, so mismatch_counter (keyed on
     # self.enabled, reset above) cannot climb because of this, and controlsMismatch cannot fire.
     # MADS only answers the separate question "may openpilot still steer?".
+    off_req = bool(self.off_request_t and
+                   (self.sm.frame * DT_CTRL - self.off_request_t) <= OFF_REQUEST_HOLD_S)
     self.mads.update(self.enabled, self.active, CS.brakePressed or CS.regenBraking,
-                     CS.cruiseState.enabled, self.events, CS.cruiseState.available)
+                     CS.cruiseState.enabled, self.events, CS.cruiseState.available, off_req)
     # madsresume2pnw: decide (never act -- the tap itself is the ford carcontroller's job) whether
     # openpilot may hand back the speed the driver had already set. Runs AFTER mads.update so it
     # sees THIS frame's lateral_only, not the previous one -- the arm edge must not be a frame late.

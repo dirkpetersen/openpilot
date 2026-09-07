@@ -174,7 +174,7 @@ class MadsPnw:
     self._brake_grace = 0
 
   def update(self, op_enabled: bool, op_active: bool, braking: bool, cruise_enabled: bool,
-             events: Events, cruise_available: bool = True) -> None:
+             events: Events, cruise_available: bool = True, off_requested: bool = False) -> None:
     """Run once per frame, AFTER selfdrived's own state machine has already decided op_enabled.
 
     op_enabled/op_active: selfdrived's own engagement, untouched by this module.
@@ -184,6 +184,9 @@ class MadsPnw:
     events:               this frame's events, read only.
     cruise_available:     CS.cruiseState.available — the ACC MASTER switch (CcStat_D_Actl in 3/4/5).
                           onebutton2pnw: the master switch turns EVERYTHING off, lateral included.
+    off_requested:        onebutton2pnw: the driver PRESSED the ACC ON/OFF button. Needed as its own
+                          input because the resulting STATE is not a usable signal — from Standby
+                          the truck never reaches Off (measured; see the carstate comment).
     """
     # The panda sets controls_allowed on the RISING edge of stock cruise engaging. If cruise
     # engages and openpilot does NOT engage with it — a NO_ENTRY is standing (calibration
@@ -202,7 +205,15 @@ class MadsPnw:
     # system switched off -- the driver's "weird three-state state", a hands-free light with no
     # cruise behind it. The button now means what it says: off is off. This is purely
     # de-authorizing, and it is checked before everything else so no later branch can re-arm.
-    if not cruise_available:
+    #
+    # TWO inputs, because one is not enough (measured 2026-09-07, see
+    # drives/2026-09-07/lightning-onoff-button/). `cruise_available` catches the press when the
+    # truck actually reaches Off, which it does reliably from Active. But from STANDBY -- exactly
+    # where the truck sits after a brake drops cruise while MADS still steers -- the button never
+    # reaches Off at all: of four presses observed there, two did nothing and two turned the system
+    # ON. So the press itself (`off_requested`) is the only signal available in the state the
+    # driver is actually complaining about.
+    if not cruise_available or off_requested:
       self._op_enabled_prev = op_enabled
       self._cruise_enabled_prev = cruise_enabled
       self._brake_grace = 0
