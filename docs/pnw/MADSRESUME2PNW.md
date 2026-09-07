@@ -48,6 +48,53 @@ have. The owner accepted that objection explicitly, on two conditions that are n
 1. **Resume ONLY to the speed the driver ALREADY SET.** Never higher, never a new speed.
 2. **The brake is always under the driver's foot**, so they can always take it back.
 
+> **⚠️ AXIOM 1 WAS AMENDED BY THE OWNER, 2026-09-06.** They asked for a second path — **gasset2pnw**
+> — where the driver names the speed **with the accelerator** and openpilot taps **SET** at whatever
+> speed they reached: *"if I have been braking and I then accelerate with the gas and when I stop
+> accelerating can't that be the speed that is then set ... that would be the most natural."*
+> That IS "a new speed", so axiom 1 as written no longer holds for SET mode, and this doc asserted
+> the opposite until the 2026-09-07 review caught it.
+>
+> **What replaces it, and why their version is the safer one:** a SET establishes the speed the
+> truck is **already doing**, so it commands **no acceleration at all**, where a RESUME hands speed
+> back to ACC and lets it climb. The acceleration-bounding gates (`setFar`, `staleContext`, the
+> headway requirement) therefore do not apply to SET mode. What still binds: `slowing` (see below),
+> the speed floor, openpilot engageability, the lead **distance floor** and **TTC**, and the rule
+> that stock cruise must not already be engaged. Axiom 2 is untouched and still carries the envelope.
+>
+> **`slowing` exists because of what this truck does not tell us:** `regenBraking` is **never set on
+> Ford** (0 occurrences in `opendbc/car/ford/`), so on a Lightning with 1-Pedal Drive a lift-off to
+> *slow down* is indistinguishable from a lift-off to *cruise* — except by speed. A SET is refused
+> while the truck is still decelerating past `DECEL_REFUSE_MS2`.
+>
+> Read the two modes as **separate features sharing a state machine**, not one feature with a
+> loophole. `ResumeDecision.mode` records which of them fired.
+
+### `slowing` / `decelUnknown` — and which drive mode gasset2pnw is for
+
+MEASURED on this truck, 2026-09-07, route `000000f9` — 7 gas-release events above 5 m/s, decel over
+the 0.4 s after lift-off: **median −0.06, p90 1.33, max 1.33, min −0.67 m/s²**. This Lightning
+**coasts** on lift-off in the mode the owner drives; it does not hard-regen. `DECEL_REFUSE_MS2` is
+therefore **1.0** — ~16× the coasting median, and 25 % below the only genuine slowing event seen.
+n=7 from one drive; `decel` / `decelAgeS` are logged so this can be re-derived, not re-argued.
+
+**Under Ford 1-Pedal Drive the arithmetic changes and gasset2pnw becomes inert by construction.**
+1PD lift-off regen is roughly 1.5–2 m/s², well past the threshold, so a SET would be refused every
+time — and in 1PD the only way to "lift to cruise" is a partial pedal, which keeps `gasPressed` true
+and never releases the arm at all. That is the correct outcome, not a bug: in 1PD, lifting off *is*
+the brake, and setting cruise would cancel exactly the deceleration the driver asked for.
+
+`decelUnknown` is the companion refusal and it is **load-bearing, not redundant**: the estimator
+resamples on its own cadence, unaligned to the driver, so the most recent completed window can
+straddle the accelerator — where the truck was speeding UP and `decel` reads negative. A measurement
+not taken entirely after both pedals came up is refused. Do not delete it on the reasoning that
+`DECEL_WINDOW_S < RELEASE_MIN_S` makes it unnecessary; it does not (see the constant's comment).
+
+| refusal | means |
+|---|---|
+| `slowing` | the truck is still decelerating past `DECEL_REFUSE_MS2` — the driver is slowing on purpose |
+| `decelUnknown` | no deceleration measurement taken entirely after lift-off yet; fails **closed** |
+
 ### The honest limit of condition 1
 
 The button we send is Ford's RESUME (`CcAsllButtnResPress` on `0x083`). **The PCM chooses the speed,

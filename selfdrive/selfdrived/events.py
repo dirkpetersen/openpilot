@@ -531,7 +531,15 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # from a feature that quietly stopped working, which is the failure mode this whole effort keeps
   # running into.
   EventName.cruiseOffRequested: {
-    ET.NO_ENTRY: NoEntryAlert("Cruise turned off"),
+    # NOT NoEntryAlert. That renders "openpilot Unavailable" with AudibleAlert.refuse -- an error
+    # chime and a red-flavoured banner -- which is what the driver saw when this feature misfired,
+    # and it is wrong even when it fires CORRECTLY: turning a system off on purpose should not be
+    # answered with a rejection noise. Silent, low priority, brief (Gemini review 2026-09-07, E).
+    ET.NO_ENTRY: Alert(
+      "Cruise off",
+      "openpilot off - press SET or RES to turn back on",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
   },
 
   EventName.madsLateralOnly: {

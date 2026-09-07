@@ -314,6 +314,14 @@ class SelfdriveD:
     # this frame's value would need an ordering change for no benefit.
     if self.mads.lateral_only and any(be.pressed and be.type == ButtonType.mainCruise for be in CS.buttonEvents):
       self.off_request_t = self.sm.frame * DT_CTRL
+    # An ENGAGE press cancels the off-request outright (Gemini review 2026-09-07, finding B). The
+    # driver may press OFF and change their mind a second later; without this the latch would still
+    # be standing, openpilot would refuse, and controlsd's cancel rule would kill the engagement
+    # they just asked for -- the same shape as the regression this feature already caused once.
+    if any(be.pressed and be.type in (ButtonType.accelCruise, ButtonType.decelCruise,
+                                      ButtonType.resumeCruise, ButtonType.setCruise)
+           for be in CS.buttonEvents):
+      self.off_request_t = 0.0
     if self.off_request_t and (self.sm.frame * DT_CTRL - self.off_request_t) <= OFF_REQUEST_HOLD_S:
       self.events.add(EventName.cruiseOffRequested)
 
@@ -853,7 +861,20 @@ class SelfdriveD:
           # executor being pinned without the matching panda safety gate, where every press is a TX
           # violation the panda drops silently. Either way the feature could not do its job, so it
           # must say so rather than leaving one quiet JSONL line as the only trace.
-          cloudlog.warning("madsresume2pnw: pressed RESUME, stock cruise never re-engaged -- check the panda safety pin (record: %s)", rec)
+          # Do NOT name one cause. This warning previously said only "check the panda safety pin",
+          # and the executor has since grown gates the brain cannot see (decide_resume's own checks,
+          # and the CC.latActive gate on the SET path) -- any of which drops the press silently
+          # while the brain has already logged `fire`. Sending a reader to the panda for what was
+          # actually an executor refusal is the wild-goose chase this line exists to prevent
+          # (Gemini review 2026-09-07 round 3, finding E).
+          why = " ".join([
+            "(1) the EXECUTOR refused it -- decide_resume gates, or the CC.latActive gate on a SET;",
+            "(2) the panda dropped the TX -- check the safety pin;",
+            "(3) the PCM ignored a legitimate press.",
+            "The executor's state is not in this record, so start there, not at the panda.",
+          ])
+          cloudlog.warning("madsresume2pnw: %s press sent, stock cruise never re-engaged. %s (record: %s)",
+                           rec.get("mode", "?"), why, rec)
         if rec.get("loud"):
           cloudlog.error("madsresume2pnw: cruise resumed to %.2f m/s, ABOVE the driver's captured set speed %.2f m/s -- investigate (record: %s)",
                          rec.get("gotMs", 0.0), rec.get("wantMs", 0.0), rec)
