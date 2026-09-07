@@ -18,6 +18,22 @@ the axioms of everything below:
   1. Resume ONLY to the speed the driver ALREADY SET. Never higher, never a new speed.
   2. The brake is always under the driver's foot, so they can always take it back.
 
+  AXIOM 1 WAS AMENDED BY THE OWNER on 2026-09-06, and this note exists because the text above is
+  otherwise flatly contradicted by the code (Fable review 2026-09-07, E1). They asked for a second
+  path -- gasset2pnw -- in which the driver names the speed WITH THE ACCELERATOR and openpilot taps
+  SET at whatever speed they reached: *"if I have been braking and I then accelerate with the gas
+  and when I stop accelerating can't that be the speed that is then set ... that would be the most
+  natural."* That IS "a new speed", so axiom 1 as written no longer holds for SET mode.
+
+  What replaces it, and why the owner's version is the safer one: a SET establishes the speed the
+  truck is ALREADY DOING, so it commands no acceleration at all, where a RESUME hands speed back to
+  ACC and lets it climb. The acceleration-bounding gates therefore do not apply to SET mode -- but
+  `slowing`, the speed floor, engageability, the lead distance floor and TTC all still do. Axiom 2
+  is untouched and still carries the whole envelope.
+
+  Read the two modes as separate features that share a state machine, not as one feature with a
+  loophole. `ResumeDecision.mode` is which of them fired.
+
 Condition 1 deserves an honest note, because the mechanism does not let us be more precise than
 this: the button we send is Ford's RESUME (`CcAsllButtnResPress` on 0x083). **The PCM chooses the
 speed, not openpilot** — Ford ACC resume returns to the PCM's own last set speed. We therefore
@@ -191,6 +207,36 @@ REJECT_AFTER_FIRE_S = 2.0
 #   * freeway memory used in a 25 mph town:       recent max ~7, set 31   -> REFUSE
 # It also bounds finding D: it caps how much ACCELERATION any resume can command, since the target
 # can never stand far above a speed the truck has just been holding.
+# gasset2pnw / Fable review 2026-09-07, finding C. `regenBraking` is NEVER SET on Ford
+# (0 occurrences in opendbc/car/ford/), so `ResumeInputs.regen_braking` is permanently False on this
+# truck and the `regen` telemetry field will read False forever -- do not read it as evidence.
+#
+# That matters most for gas-set. On a Lightning with 1-Pedal Drive, LIFTING OFF *IS* THE BRAKE, and
+# it is invisible to us: a driver lifting off to slow down looks identical to one lifting off to
+# cruise. Setting ACC then removes exactly the deceleration they asked for. Speed is the one honest
+# witness we have, so refuse a SET while the truck is still slowing meaningfully.
+#
+# MEASURED on this truck 2026-09-07, route 000000f9 -- 7 gas-release events above 5 m/s, decel over
+# the 0.4 s after lift-off:
+#     median -0.06    p90 1.33    max 1.33    min -0.67
+# The owner's call was right and the theory was wrong: this Lightning COASTS on lift-off, it does
+# not hard-regen, so the 1-Pedal hazard this gate was written for is not how the truck behaves. The
+# median is essentially zero. Exactly one event showed real deceleration (1.33), and that is the
+# one worth refusing.
+#
+# 1.0 m/s^2 therefore: ~16x the coasting median, and 25% below the only genuine slowing event
+# observed. 0.5 would also have caught it, but sits closer to ordinary coasting than the evidence
+# justifies. n=7 is a SMALL SAMPLE from one drive -- the `decel`/`decelAgeS` telemetry fields exist
+# so this can be re-derived rather than re-argued.
+DECEL_REFUSE_MS2 = 1.0
+# 0.4 s. NOTE, because the obvious reading is wrong and would invite deleting `decelUnknown` as
+# redundant: this being shorter than RELEASE_MIN_S (0.5) does NOT guarantee a fresh window by the
+# earliest fire. The estimator resamples on its own cadence, unaligned to the driver, so the first
+# window that starts at or after lift-off closes anywhere in [t_release + 0.4, t_release + 0.8).
+# What makes the gate safe is `decelUnknown` refusing until a window taken ENTIRELY after lift-off
+# exists -- not this constant (Fable review 2026-09-07 round 3, E4).
+DECEL_WINDOW_S = 0.4
+
 V_MAX_WINDOW_S = 60.0
 V_MAX_MARGIN_MS = 5.0        # ~11 mph of slack for a set speed traffic never let the truck reach
 # The ABSOLUTE cap, and the primary bound on uncommanded acceleration (Fable review 2026-09-06, A1).
@@ -277,7 +323,7 @@ def _finite(x) -> bool:
     return False
 
 
-def lead_gate(has_lead, d_rel, v_lead, v_ego) -> str | None:
+def lead_gate(has_lead, d_rel, v_lead, v_ego, require_headway: bool = True) -> str | None:
   """PURE. Returns None if the road ahead is open enough to hand speed back, else the name of the
   binding sub-gate. A FAILED radar read (`has_lead is None`) is `leadUnknown` -- a refusal, never
   a permissive default (CLAUDE.md rule 2: an error is not a negative result)."""
@@ -295,7 +341,12 @@ def lead_gate(has_lead, d_rel, v_lead, v_ego) -> str | None:
   v = float(v_ego)
   if v <= 0.1:
     return "leadClose"
-  if d / v < LEAD_MIN_HEADWAY_S:
+  # The HEADWAY check asks "would ACC have to close a gap it would not otherwise close" -- a
+  # question only a RESUME raises, because only a resume accelerates toward a remembered speed.
+  # A SET at the current speed cannot close anything, so gasset2pnw skips this one sub-gate. The
+  # distance floor and TTC below are NOT skipped: they ask "is something about to hit us", which
+  # applies no matter what speed is being handed over (Gemini review 2026-09-07, finding C).
+  if require_headway and d / v < LEAD_MIN_HEADWAY_S:
     return "leadGap"
   v_close = v - float(v_lead)
   if v_close > 0.0 and (d / v_close) < LEAD_MIN_TTC_S:
@@ -344,6 +395,11 @@ class MadsResumeBrain:
     # post-press verification
     self._verify_until: float | None = None
     self._verify_set: float | None = None
+    # the mode of the press this verify belongs to, snapshotted at fire. `_fired_mode` is cleared by
+    # a gas-reopen, and `_used_gas` keeps changing, so neither can be trusted 10 s later when the
+    # verify lands (Fable review 2026-09-07 round 3, C1 -- reproduced: a RESUME press reported
+    # "set", and the selfdrived warning then announced the wrong button).
+    self._verify_mode: str | None = None
     # Edge detector. THREE-STATE: None = "never observed", which is NOT the same fact as
     # "observed False" (Gemini review 2026-09-06). With a plain False, the first tick after the
     # brain becomes active -- e.g. a selfdrived restart mid-drive
@@ -365,6 +421,17 @@ class MadsResumeBrain:
     # approximate rolling max of v_ego, for the cross-context guard
     self._v_max: float | None = None
     self._v_max_t = 0.0
+    # deceleration estimate, for the gas-set regen blindness above
+    self._v_ref: float | None = None
+    self._v_ref_t = 0.0
+    self._decel = 0.0                # m/s^2, positive = slowing
+    # when the window that produced `_decel` STARTED. The gate requires this to be at or after the
+    # moment both pedals came up, so a measurement taken while the driver was still on the power
+    # can never be mistaken for a post-lift-off one.
+    self._decel_from = 0.0
+    # the mode this arm actually FIRED in, sampled at fire. `_used_gas` keeps changing afterwards,
+    # so a record that reads it live can report the wrong button for a press already sent.
+    self._fired_mode: str | None = None
     # diagnostics: how many times update() raised inside the caller's guard (caller-owned counter
     # lives in selfdrived; this one just proves the brain itself ran).
     self.ticks = 0
@@ -401,7 +468,9 @@ class MadsResumeBrain:
       "vMax": round(self._v_max, 2) if self._v_max is not None else None,
       "vMaxAgeS": round(i.now - self._v_max_t, 1) if self._v_max is not None else None,
       "supp": bool(self._suppressed),
-      "mode": "set" if self._used_gas else "res",
+      "mode": self._fired_mode if self._fired_mode is not None else ("set" if self._used_gas else "res"),
+      "decel": round(self._decel, 2),
+      "decelAgeS": round(i.now - self._decel_from, 2) if self._decel_from else None,
       "sinceFireS": round(i.now - self._fired_t, 2) if self._fired_t is not None else None,
     }
     if extra:
@@ -418,6 +487,7 @@ class MadsResumeBrain:
   def _disarm(self) -> None:
     self._armed = False
     self._used_gas = False
+    self._fired_mode = None
     self._armed_set = None
     self._armed_set_age = 0.0
     self._released_t = None
@@ -447,6 +517,11 @@ class MadsResumeBrain:
       self._fired_t = None
       self._v_max = None
       self._v_max_t = 0.0
+      self._v_ref = None
+      self._v_ref_t = 0.0
+      self._decel = 0.0
+      self._decel_from = 0.0
+      self._fired_mode = None
       self._cc_prev = bool(i.cruise_enabled)
       self._set_ms = None
       self._set_t = None
@@ -468,6 +543,14 @@ class MadsResumeBrain:
       if self._v_max is None or v >= self._v_max or (i.now - self._v_max_t) > V_MAX_WINDOW_S:
         self._v_max = v
         self._v_max_t = i.now
+      # deceleration over a fixed window. Cheap, and it needs no history buffer.
+      if self._v_ref is None:
+        self._v_ref, self._v_ref_t = v, i.now
+      elif (i.now - self._v_ref_t) >= DECEL_WINDOW_S:
+        dt = i.now - self._v_ref_t
+        self._decel = (self._v_ref - v) / dt if dt > 0.0 else 0.0
+        self._decel_from = self._v_ref_t
+        self._v_ref, self._v_ref_t = v, i.now
 
     cc_rising = bool(i.cruise_enabled) and self._cc_prev is False
     self._cc_prev = bool(i.cruise_enabled)
@@ -500,7 +583,8 @@ class MadsResumeBrain:
         # Cruise never came back inside the window. That is not an error (the press may have been
         # correctly ignored), but it IS the difference between "we pressed and nothing happened"
         # and "we pressed and it worked", so it is logged.
-        out.records.append(self._snap(i, {"phase": "verify", "reason": "noCruise", "fired": True}))
+        out.records.append(self._snap(i, {"phase": "verify", "reason": "noCruise", "fired": True,
+                                          "mode": self._verify_mode or "res"}))
         self._verify_until = None
       elif i.cruise_enabled and _finite(i.set_speed_ms) and float(i.set_speed_ms) > 0.0:
         got = float(i.set_speed_ms)
@@ -512,7 +596,7 @@ class MadsResumeBrain:
         # behave as this whole design assumes, which is exactly the thing the log exists to catch.
         # A SET establishes a NEW speed and the PCM rounds it to the nearest mph, so it cannot be
         # held to the tolerance a RESUME is (which must land exactly on a remembered value).
-        tol = SET_MODE_TOL_MS if self._used_gas else SET_TOL_MS
+        tol = SET_MODE_TOL_MS if self._verify_mode == "set" else SET_TOL_MS
         if got > want + tol:
           reason = "setHigher"
         elif got < want - tol:
@@ -522,6 +606,8 @@ class MadsResumeBrain:
         out.records.append(self._snap(i, {
           "phase": "verify", "reason": reason, "fired": True,
           "gotMs": round(got, 2), "wantMs": round(want, 2),
+          # explicit, so it cannot fall back to whatever `_used_gas` happens to be now
+          "mode": self._verify_mode or "res",
         }))
         if reason != "ok":
           out.records[-1]["loud"] = True
@@ -638,12 +724,28 @@ class MadsResumeBrain:
       # measures from the last moment the driver was doing something, not from the brake; once the
       # foot comes up the ordinary 0.5-3.0 s window applies and settles it within seconds either way.
       self._arm_t = i.now
-      if self._offer_t is not None:
-        # An offer was on the wire when the driver got on the power. Withdraw it -- they are
-        # commanding speed themselves, and the target is about to change.
-        out.records.append(self._snap(i, {"phase": "offerEnd", "reason": "gas", "fired": True}))
-        self._offer_t = None
+      if self._done or self._offer_t is not None:
+        # This arm has already made its attempt (offer in flight, fired, or window closed) and the
+        # driver has now gone back on the power. Close it out and start a FRESH episode.
+        #
+        # Fable review 2026-09-07, D1/D2/D3 -- three reproduced silent failures, all from re-opening
+        # an arm in place instead of restarting it:
+        #   D1 the eid was kept, and the executor latches ONE press per eid -- so the SET was
+        #      refused while the brain logged `fire`, and selfdrived then warned about the panda
+        #      safety pin. A wild-goose chase pointing at the wrong subsystem entirely.
+        #   D2 `_terminate` is a no-op once `_terminal` is set, so a later refusal wrote NO record.
+        #   D3 if the offer had already expired, `_done` stayed True and `if self._done: return`
+        #      killed the gas-set outright -- no press, no record, arm dying 20 s later in silence.
+        if self._offer_t is not None:
+          out.records.append(self._snap(i, {"phase": "offerEnd", "reason": "gas", "fired": True}))
+          self._offer_t = None
+        if not self._terminal:
+          self._terminate(i, out, "gas")
+        self._eid = round(i.now, 3)      # a NEW key, or the executor will refuse the press
         self._done = False
+        self._terminal = False
+        self._fired_mode = None
+        out.records.append(self._snap(i, {"phase": "arm", "reason": "gasReopen", "fired": False}))
 
     abort = None
     if i.blocked:
@@ -729,11 +831,23 @@ class MadsResumeBrain:
     self._done = True
     self._offer_t = i.now
     self._fired_t = i.now
+    if self._verify_until is not None:
+      # A previous press is still being verified and this fire is about to overwrite its window.
+      # Emit its outcome first rather than dropping it (Rule 2). Fable round 3 called this "low",
+      # but the C2 test proved the record is lost outright, not merely delayed: without this the
+      # RESUME press in a resume-then-gas-then-set sequence is never verified at all.
+      out.records.append(self._snap(i, {
+        "phase": "verify", "reason": "superseded", "fired": True,
+        "mode": self._verify_mode or "res",
+        "wantMs": round(self._verify_set, 2) if self._verify_set is not None else None,
+      }))
     self._verify_until = i.now + VERIFY_S
     # gasset2pnw: the target is the speed the driver just chose with the accelerator, sampled once
     # here and never moved afterwards -- exactly as _armed_set is for a resume.
     target = float(i.v_ego) if self._used_gas else float(self._armed_set)
     self._verify_set = target
+    self._fired_mode = "set" if self._used_gas else "res"
+    self._verify_mode = self._fired_mode
     self._terminal = True          # "fire" IS this arm's terminal record
     out.records.append(self._snap(i, {"phase": "fire", "reason": None, "fired": True}))
     out.offer = True
@@ -768,7 +882,27 @@ class MadsResumeBrain:
     # abort chain and again independently in the executor) that stock cruise is not already engaged,
     # since a SET tap while engaged would move the driver's set speed rather than establish it.
     if self._used_gas:
-      return None
+      # The driver is still SLOWING. Because Ford never reports regenBraking (see DECEL_REFUSE_MS2),
+      # a lift-off to decelerate is indistinguishable from a lift-off to cruise except by speed --
+      # and setting ACC here would cancel exactly the deceleration they asked for. This is the one
+      # gate that exists because of what this car does NOT tell us.
+      # The measurement must be one taken ENTIRELY AFTER both pedals came up. The estimator
+      # resamples on its own 0.4 s cadence, unaligned to the driver, so at the earliest fire the
+      # most recent completed window can still be one that straddled the accelerator -- where the
+      # truck was speeding UP and `_decel` reads negative. That would wave through exactly the
+      # 1-Pedal lift-off this gate exists to catch (Gemini review 2026-09-07 round 3, finding B).
+      # An un-fresh measurement is a REFUSAL, not a pass: this is the gate standing in for a signal
+      # the car never sends, so it fails closed.
+      if self._released_t is None or self._decel_from < self._released_t:
+        return "decelUnknown"
+      if self._decel > DECEL_REFUSE_MS2:
+        return "slowing"
+      # A SET-to-current commands no acceleration, so the gates that bound how much ACC may speed up
+      # do not apply. But "commands no acceleration" is NOT "the road ahead is irrelevant": stock
+      # ACC takes a moment to react on engagement. So the two sub-gates that ask whether something
+      # is about to hit us -- the 20 m floor and the TTC -- still bind. Only the headway requirement
+      # is relaxed, and only because it asks a question a SET cannot raise.
+      return lead_gate(i.has_lead, i.d_rel, i.v_lead, i.v_ego, require_headway=False)
     if self._armed_set is None:
       return "noSet"                                    # gate 6
     # gate 6, live half: the truck must not be reporting a set speed ABOVE the one we captured.

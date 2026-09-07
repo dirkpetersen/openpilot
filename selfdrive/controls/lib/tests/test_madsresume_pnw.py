@@ -778,6 +778,205 @@ def test_the_arm_survives_a_long_acceleration():
   assert d.offers[-1][2] == pytest.approx(25.0)
 
 
+def test_gas_after_a_fire_gets_a_NEW_episode_id():
+  """Fable D1. The executor latches one press per `eid`. Re-opening an arm in place kept the eid, so
+  the SET was silently refused by the executor while the brain logged `fire` -- and selfdrived then
+  warned about the panda safety pin, pointing at the wrong subsystem entirely."""
+  d = Drive()
+  d.tick(50)                                                   # capture SET
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, **hold)
+  d.tick(200, **hold)                                          # RES fires here
+  assert d.fired(), "precondition: the resume fires"
+  first_eid = d.offers[-1][1]
+  d.tick(60, gas_pressed=True, v_ego=SET, **hold)              # back on the power
+  d.tick(400, v_ego=SET, **hold)                               # lift -> SET must fire
+  assert len(d.offers) > 1, f"the gas-set must produce a second offer; records={d.records[-4:]}"
+  assert d.offers[-1][1] != first_eid, \
+    f"the second press MUST carry a new eid or the executor refuses it silently (both {first_eid})"
+
+
+def test_gas_after_an_EXPIRED_offer_still_sets():
+  """Fable D3. If the resume offer expired without the PCM acting, `_done` stayed True and
+  `if self._done: return` killed the gas-set outright -- no press, no record, arm dying in silence
+  20 s later."""
+  d = Drive()
+  d.tick(50)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, **hold)
+  d.tick(500, **hold)                                          # fire, then the offer expires
+  n_before = len(d.offers)
+  d.tick(60, gas_pressed=True, v_ego=SET, **hold)
+  d.tick(400, v_ego=SET, **hold)
+  assert len(d.offers) > n_before, f"gas after an expired offer must still set; {d.records[-4:]}"
+  fires = [r for r in d.records if r["phase"] == "fire"]
+  assert fires[-1]["mode"] == "set"
+
+
+def test_the_verify_record_names_the_button_that_was_ACTUALLY_pressed():
+  """Fable round 3, C1. `_snap` fell back to the LIVE `_used_gas`, and a gas-reopen clears
+  `_fired_mode` -- so the RESUME press's verify, arriving up to VERIFY_S later, reported "set".
+  The selfdrived warning prints that field, so it would have announced the wrong button for a
+  press that never happened: exactly the wild-goose chase the warning exists to prevent.
+
+  My previous attempt at this test asserted `mode in (None, "res", "set")`, which CANNOT FAIL, and
+  stopped before the verify ever landed. This one ticks past VERIFY_S and pins the value."""
+  d = Drive()
+  d.tick(50)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, **hold)
+  d.tick(200, **hold)                                          # RESUME fires
+  fires = [r for r in d.records if r["phase"] == "fire"]
+  assert fires and fires[0]["mode"] == "res", "precondition: a RESUME fired"
+  # the driver now goes back on the power, which reopens the episode in SET mode
+  d.tick(60, gas_pressed=True, v_ego=SET, **hold)
+  assert d.b._used_gas, "precondition: the episode is now in gas mode"
+  # run past VERIFY_S with cruise never returning, so the RESUME's verify lands
+  d.tick(int((M.VERIFY_S + 1.0) / DT), v_ego=SET, **hold)
+  verifies = [r for r in d.records if r["phase"] == "verify"]
+  assert verifies, "the resume press must be verified"
+  assert verifies[0]["mode"] == "res", \
+    f"verify for a RESUME must say 'res', got {verifies[0]['mode']!r} (reports an unpressed button)"
+
+
+def test_gasset_refuses_while_the_truck_is_still_slowing():
+  """Fable C. `regenBraking` is NEVER set on Ford, so on a truck with 1-Pedal Drive a lift-off to
+  SLOW DOWN is indistinguishable from a lift-off to cruise -- except by speed. Setting ACC there
+  would cancel exactly the deceleration the driver asked for."""
+  d = Drive()
+  d.tick(50)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, v_ego=25.0, **hold)
+  d.tick(60, gas_pressed=True, v_ego=25.0, **hold)
+  # lift off, and keep decelerating hard (regen) -- 2 m/s^2 over the window
+  v = 25.0
+  for _ in range(400):
+    v = max(12.0, v - 2.0 * DT)
+    d.tick(1, v_ego=v, **hold)
+  assert not d.fired(), f"must not set while still slowing; records={d.records[-3:]}"
+  assert "slowing" in d.reasons("refuse"), d.records[-3:]
+
+
+def test_the_noCruise_verify_names_the_RESUME_that_was_pressed():
+  """Fable round 4, scenario P1. My previous attempt at this claimed to pin the `noCruise` record
+  but never reached it: the SET fired and SUPERSEDED the RESUME's window, so the only record the
+  test ever saw was the `superseded` one -- added in the same round. Mutating the `noCruise` site
+  back to live `_used_gas` left it passing.
+
+  Here the SET is kept from firing after the reopen (a close lead), so the RESUME's own window runs
+  out and its `noCruise` record actually lands."""
+  d = Drive()
+  d.tick(50)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, **hold)
+  d.tick(200, **hold)                                          # RESUME fires
+  assert [r for r in d.records if r["phase"] == "fire"], "precondition: a RESUME fired"
+  d.tick(60, gas_pressed=True, v_ego=SET, **hold)              # reopen in gas mode
+  # a close lead keeps the SET from ever firing, so nothing supersedes the RESUME's verify window
+  blocked = dict(has_lead=True, d_rel=12.0, v_lead=SET, v_ego=SET)
+  d.tick(int((M.VERIFY_S + 1.0) / DT), **blocked, **hold)
+  nc = [r for r in d.records if r["phase"] == "verify" and r["reason"] == "noCruise"]
+  assert nc, f"the RESUME press must be verified; phases={d.phases()[-6:]}"
+  assert nc[0]["mode"] == "res", (
+    f"a noCruise verify for a RESUME press must say 'res', got {nc[0]['mode']!r}")
+
+
+def test_the_got_want_verify_names_the_RESUME_and_uses_its_tolerance():
+  """Fable round 4, scenario P2. Pins BOTH the mode on the got/want verify record AND the tolerance
+  choice: a RESUME must be judged against SET_TOL_MS (tight, it restores a remembered value), not
+  the looser SET_MODE_TOL_MS. Cruise returns 0.8 m/s above the captured speed -- inside the SET
+  tolerance, outside the RESUME one -- so a wrong `tol` reports 'ok' instead of 'setHigher'."""
+  d = Drive()
+  d.tick(50)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, **hold)
+  d.tick(200, **hold)                                          # RESUME fires
+  d.tick(60, gas_pressed=True, v_ego=SET, **hold)              # reopen -> _used_gas True
+  d.tick(20, v_ego=SET, **hold)
+  # stock cruise comes back ABOVE the captured set speed, while the episode is in gas mode
+  d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=True,
+         set_speed_ms=SET + 0.8, v_ego=SET)
+  vs = [r for r in d.records if r["phase"] == "verify" and r["reason"] in ("setHigher", "ok")]
+  assert vs, f"the resume must be verified once cruise returns; phases={d.phases()[-6:]}"
+  assert vs[0]["reason"] == "setHigher", \
+    f"0.8 m/s above capture is outside SET_TOL_MS; a RESUME must not use the SET tolerance: {vs[0]['reason']!r}"
+  assert vs[0]["mode"] == "res", f"must name the RESUME, got {vs[0]['mode']!r}"
+
+
+def test_gasset_refuses_when_the_decel_measurement_is_not_fresh():
+  """Gemini round 3, finding B. The estimator resamples on its own cadence, unaligned to the driver,
+  so the most recent completed window can straddle the accelerator -- where the truck was speeding
+  UP and `_decel` reads negative, waving through the very lift-off the gate exists to catch. A
+  measurement not taken entirely after both pedals came up is a REFUSAL."""
+  d = Drive()
+  d.tick(50)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, v_ego=18.0, **hold)
+  d.tick(60, gas_pressed=True, v_ego=18.0, **hold)
+  d.tick(400, v_ego=18.0, **hold)
+  assert d.fired(), "sanity: a fresh measurement must still allow the set"
+  # now force the stale case directly: a measurement whose window began before the release
+  b = d.b
+  b._released_t = 100.0
+  b._decel_from = 99.0
+  b._decel = -1.0                                  # "accelerating", from the on-gas window
+  b._used_gas = True
+  b._armed_set = None
+  inp = mk(101.0, lateral_only=True, op_enabled=False, cruise_enabled=False,
+           set_speed_ms=0.0, v_ego=18.0)
+  assert b._gates(inp) == "decelUnknown", "a stale decel measurement must fail CLOSED"
+
+
+def test_gasset_still_refuses_a_close_lead():
+  """Gemini finding C. "A SET commands no acceleration" is true, but it is NOT the same as "the road
+  ahead is irrelevant": stock ACC takes a moment to react on engagement, and the driver has just
+  lifted off expecting regen. The 20 m floor and the TTC check still bind for SET mode."""
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d = Drive()
+  d.tick(50)
+  d.tick(20, brake_pressed=True, v_ego=18.0, **hold)
+  d.tick(60, gas_pressed=True, v_ego=18.0, **hold)
+  d.tick(400, v_ego=18.0, has_lead=True, d_rel=12.0, v_lead=10.0, **hold)   # 12 m -- inside the floor
+  assert not d.fired(), f"a close lead must still refuse a SET; records={d.records[-3:]}"
+  assert "leadClose" in d.reasons("refuse"), d.records[-3:]
+
+
+def test_gasset_skips_only_the_headway_subgate():
+  """The one sub-gate a SET legitimately skips: 2 s headway asks "would ACC have to close a gap",
+  which only a RESUME can do. A lead at 25 m with matched speed is inside 2 s headway at 18 m/s but
+  is neither close nor closing -- a RESUME refuses it, a SET must not."""
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  lead = dict(has_lead=True, d_rel=25.0, v_lead=18.0)      # 1.4 s headway, zero closing speed
+  d = Drive()
+  d.tick(50)
+  d.tick(20, brake_pressed=True, v_ego=18.0, **hold)
+  d.tick(60, gas_pressed=True, v_ego=18.0, **hold)
+  d.tick(400, v_ego=18.0, **lead, **hold)
+  assert d.fired(), f"SET must not refuse on headway alone; records={d.records[-3:]}"
+  # and the same geometry DOES refuse a resume, which is what makes the distinction real
+  assert lead_gate(True, 25.0, 18.0, 18.0) == "leadGap"
+  assert lead_gate(True, 25.0, 18.0, 18.0, require_headway=False) is None
+
+
+def test_the_offrequest_latch_is_cleared_by_an_engage_press():
+  """Gemini finding B. The driver may press OFF and change their mind a second later. If the latch
+  still stood, openpilot would refuse and controlsd's cancel rule would kill the engagement they
+  just asked for -- the same shape as the regression this feature already caused once.
+
+  Pinned by reading selfdrived.py's source, since it cannot be imported without cereal here."""
+  import pathlib
+  import re
+  src = (pathlib.Path(M.__file__).parent.parent.parent / "selfdrived" / "selfdrived.py").read_text()
+  # NOT the first occurrence -- __init__ also assigns 0.0. Match the guarded clear specifically:
+  # a buttonEvents test followed by the assignment.
+  m = re.search(r"be\.type in \((.*?)\)\s*\n?.*?for be in CS\.buttonEvents\):\s*\n\s*self\.off_request_t = 0\.0",
+                src, re.S)
+  assert m, "no engage-button press clears the off-request latch"
+  btns = m.group(1)
+  for btn in ("accelCruise", "decelCruise", "resumeCruise", "setCruise"):
+    assert btn in btns, f"an {btn} press must clear the off-request latch, got: {btns}"
+
+
 def test_gasset_still_respects_the_speed_floor_and_engageability():
   """The two gates that DO bound a set-to-current: it is still a self-engagement."""
   hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
