@@ -238,7 +238,7 @@ def test_double_brake_inside_the_optout_window_suppresses_the_resume():
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)   # released
   # second press 0.4 s after the first -- well inside DOUBLE_BRAKE_S
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True, set_speed_ms=0.0)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(400, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
   assert not d.fired()
   assert "suppress" in d.phases(), d.records
   assert "doubleBrake" in d.reasons("suppress")
@@ -251,11 +251,12 @@ def test_a_later_brake_press_starts_a_FRESH_episode_and_can_resume():
   d = Drive()
   d.tick(50)                                                                 # capture
   hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
-  # first press, aborted immediately by the driver touching the accelerator
+  # first press, aborted by a blocking event. (The accelerator no longer aborts -- since gasset2pnw
+  # it switches the episode to SET mode instead; see the gas-set tests.)
   d.tick(20, brake_pressed=True, **hold)
-  d.tick(20, gas_pressed=True, **hold)
+  d.tick(20, blocked=True, **hold)
   assert not d.fired()
-  assert "gas" in d.reasons("refuse")
+  assert "blocked" in d.reasons("refuse")
   # coast well past DOUBLE_BRAKE_S so the next press is a new intent, not a double-tap
   d.tick(200, **hold)
   # second press -> new arm -> release -> must resume
@@ -332,11 +333,11 @@ def test_braking_right_after_our_resume_stops_it_instead_of_queueing_another():
   """Gemini finding B. The driver's reflex against an unwanted resume is ONE firm brake. If that
   press re-armed, releasing it would surge again -- an unwinnable fight. A brake inside
   REJECT_AFTER_FIRE_S of our own fire latches the opt-out instead."""
-  d = normal_brake_and_resume()
+  d = normal_brake_and_resume(post_ticks=100)     # fire lands ~1.2 s in; brake while it is fresh
   assert d.fired(), "precondition: the reference drive resumes"
   n_before = len(d.offers)
   hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
-  d.tick(20, brake_pressed=True, **hold)          # driver brakes to reject it
+  d.tick(20, brake_pressed=True, **hold)          # driver brakes to reject it, inside the window
   d.tick(400, **hold)                              # ... and releases
   assert len(d.offers) == n_before, f"must NOT resume again; records={d.records}"
   assert "postResumeBrake" in d.reasons("suppress"), d.records
@@ -347,7 +348,7 @@ def test_a_lingering_cruise_frame_does_not_wipe_the_optout():
   the LEVEL of cruise_enabled, so a single frame where cruiseState.enabled still read True after
   the driver's rejection brake wiped the opt-out and the truck resumed again. mads_pnw.py:235-237
   says the PCM ordering is not guaranteed, so that frame is not hypothetical."""
-  d = normal_brake_and_resume()
+  d = normal_brake_and_resume(post_ticks=100)     # fire lands ~1.2 s in; brake while it is fresh
   assert d.fired(), "precondition: the reference drive resumes"
   n_before = len(d.offers)
   hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
@@ -476,7 +477,7 @@ def test_gate6_no_captured_set_speed_refuses_immediately_at_arm():
   d = Drive()
   d.tick(50, cruise_enabled=False, set_speed_ms=0.0)
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True, set_speed_ms=0.0)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(400, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
   assert not d.fired()
   assert d.reasons("refuse") == ["noSet"]
   assert d.records[0]["phase"] == "arm" and d.records[0]["setMs"] is None
@@ -488,17 +489,19 @@ def test_gate6_a_stale_capture_refuses():
   d.tick(50)
   d.tick(int((M.SET_MAX_AGE_S + 0.5) / DT), cruise_enabled=False, set_speed_ms=0.0, op_enabled=False)
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True, set_speed_ms=0.0)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(400, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
   assert not d.fired()
   assert "noSet" in d.reasons("refuse")
 
 
 def test_gate6_a_set_speed_below_the_sanity_floor_is_not_a_set_speed():
   d = Drive()
-  d.tick(50, set_speed_ms=3.0, v_ego=3.0)          # 3 m/s ~ 7 mph, below SET_MIN_MS
+  # v_ego stays resumable throughout, so the SPEED floor cannot be what refuses -- this test is
+  # about the CAPTURE floor, and `slow` is evaluated before `noSet`.
+  d.tick(50, set_speed_ms=3.0, v_ego=12.0)         # reported set 3 m/s ~ 7 mph, below SET_MIN_MS
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True,
-         set_speed_ms=0.0, v_ego=3.0)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0, v_ego=3.0)
+         set_speed_ms=0.0, v_ego=12.0)
+  d.tick(400, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0, v_ego=12.0)
   assert not d.fired()
   assert "noSet" in d.reasons("refuse")
 
@@ -565,7 +568,6 @@ def test_verify_records_a_correct_resume_quietly():
 # ---------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("override,reason", [
-  ({"gas_pressed": True}, "gas"),
   ({"blocked": True}, "blocked"),
   ({"op_enabled": True}, "opEngaged"),
   ({"cruise_available": False}, "accOff"),
@@ -602,7 +604,7 @@ def test_low_speed_refuses():
   d.tick(50, v_ego=3.0)                             # ~7 mph, below V_EGO_MIN_MS
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True,
          set_speed_ms=0.0, v_ego=3.0)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0, v_ego=3.0)
+  d.tick(400, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0, v_ego=3.0)
   assert not d.fired()
 
 
@@ -621,7 +623,7 @@ def test_gate8_inert_without_mads_even_on_the_arming_tick():
   d = Drive(mads_available=False)
   d.tick(50)
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True, set_speed_ms=0.0)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(400, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
   assert not d.fired() and d.records == []
 
 
@@ -676,7 +678,7 @@ def test_the_capture_survives_the_cruise_off_gap_between_two_brakes():
   d.tick(50)                                                                 # capture the set speed
   hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
   d.tick(20, brake_pressed=True, **hold)                                     # first brake
-  d.tick(20, gas_pressed=True, **hold)                                       # driver overrides -> refuse
+  d.tick(20, gas_pressed=True, **hold)                                       # gasset2pnw: switches to SET mode
   d.tick(3000, **hold)                                                       # 30 s with cruise OFF
   d.tick(20, brake_pressed=True, **hold)                                     # brake again
   d.tick(400, **hold)
@@ -694,7 +696,7 @@ def test_the_capture_is_forgotten_when_the_acc_master_goes_off():
   d.tick(50, cruise_enabled=False, cruise_available=False)                   # master off
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, cruise_available=False,
          brake_pressed=True, set_speed_ms=0.0)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, cruise_available=False,
+  d.tick(400, lateral_only=True, op_enabled=False, cruise_enabled=False, cruise_available=False,
          set_speed_ms=0.0)
   assert not d.fired()
   # and it must name the SPECIFIC cause, not the noSet it caused one level down
@@ -713,7 +715,7 @@ def test_the_forgotten_capture_is_not_resurrected_when_the_master_comes_back():
   d.tick(50, cruise_enabled=False, cruise_available=True)                    # master back ON, cruise idle
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True,
          set_speed_ms=0.0)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(400, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
   assert not d.fired(), "a set speed from before an explicit master-off must not be resurrected"
   assert "noSet" in d.reasons("refuse"), d.records
 
@@ -729,6 +731,68 @@ def test_a_late_brake_inside_the_mads_grace_window_still_captures_the_set_speed(
   d.tick(500, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
   assert d.fired(), f"a late brake inside the MADS grace window must still resume; {d.records}"
   assert all(abs(o[2] - SET) < 1e-6 for o in d.offers)
+
+
+def test_gasset_lifting_off_the_accelerator_sets_that_speed():
+  """gasset2pnw, the driver's own design: "if I have been braking and I then accelerate with the
+  gas, when I stop accelerating can't that be the speed that is then set". The target is the speed
+  they reached, and the button is SET (not RESUME), because no remembered speed is involved."""
+  d = Drive()
+  d.tick(50)                                                   # capture SET (29 m/s) -- unused here
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, v_ego=14.0, **hold)           # brake
+  d.tick(60, gas_pressed=True, v_ego=18.0, **hold)             # driver picks a speed on the pedal
+  d.tick(400, v_ego=18.0, **hold)                              # ... and lifts off
+  assert d.fired(), f"lifting off must set that speed; records={d.records[-3:]}"
+  eid, target = d.offers[-1][1], d.offers[-1][2]
+  assert target == pytest.approx(18.0), f"must target the gas-chosen speed, got {target}"
+  fires = [r for r in d.records if r["phase"] == "fire"]
+  assert fires[-1]["mode"] == "set", f"must tap SET, not RESUME: {fires[-1]}"
+
+
+def test_gasset_works_with_no_remembered_set_speed_at_all():
+  """The 17:11:00 and 17:13:42 refusals on the 2026-09-06 drive were `noSet` -- no capture existed,
+  and under the old design nothing could bring cruise back but the driver doing it by hand. The
+  accelerator route consults no memory, so it works precisely where RESUME cannot."""
+  d = Drive()
+  d.tick(50, cruise_enabled=False, set_speed_ms=0.0)           # cruise NEVER engaged -> no capture
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, v_ego=12.0, **hold)
+  d.tick(60, gas_pressed=True, v_ego=16.0, **hold)
+  d.tick(400, v_ego=16.0, **hold)
+  assert d.fired(), f"gas-set needs no captured speed; records={d.records[-3:]}"
+  assert d.offers[-1][2] == pytest.approx(16.0)
+  assert "noSet" not in d.reasons("refuse"), d.records
+
+
+def test_the_arm_survives_a_long_acceleration():
+  """A freeway on-ramp is easily a 20 s pull. ARM_MAX_S measured from the brake would expire the
+  episode before the driver ever lifted off, losing exactly the case gas-set exists for."""
+  d = Drive()
+  d.tick(50)
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(20, brake_pressed=True, v_ego=12.0, **hold)
+  d.tick(int((M.ARM_MAX_S + 5.0) / DT), gas_pressed=True, v_ego=25.0, **hold)   # 25 s on the power
+  d.tick(400, v_ego=25.0, **hold)
+  assert d.fired(), f"a long acceleration must not expire the episode; records={d.records[-3:]}"
+  assert d.offers[-1][2] == pytest.approx(25.0)
+
+
+def test_gasset_still_respects_the_speed_floor_and_engageability():
+  """The two gates that DO bound a set-to-current: it is still a self-engagement."""
+  hold = dict(lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d = Drive()
+  d.tick(50)
+  d.tick(20, brake_pressed=True, v_ego=4.0, **hold)
+  d.tick(60, gas_pressed=True, v_ego=4.0, **hold)
+  d.tick(400, v_ego=4.0, **hold)                               # below V_EGO_MIN_MS
+  assert not d.fired(), "must not self-engage below the speed floor"
+  d2 = Drive()
+  d2.tick(50)
+  d2.tick(20, brake_pressed=True, v_ego=18.0, **hold)
+  d2.tick(60, gas_pressed=True, v_ego=18.0, **hold)
+  d2.tick(400, v_ego=18.0, engageable=False, **hold)           # a standing NO_ENTRY
+  assert not d2.fired(), "must not self-engage while openpilot itself would refuse to engage"
 
 
 def test_the_published_wire_contract_matches_what_the_executor_parses():
@@ -754,7 +818,14 @@ def test_the_published_wire_contract_matches_what_the_executor_parses():
   keys = {k.value for k in offer.args[1].keys}
   assert keys == {"dir", "ts", "eid", "set"}, f"wire contract drifted: {keys}"
   direction = next(v for k, v in zip(offer.args[1].keys, offer.args[1].values, strict=True) if k.value == "dir")
-  assert direction.value == "res", "the resume payload must be marked dir='res'"
+  # gasset2pnw: `dir` is no longer a literal -- it carries the brain's chosen mode ("res" to tap
+  # RESUME, "set" to tap SET at the driver's gas-chosen speed). Pin that it is wired to out.mode and
+  # nothing else, since a stray literal here would silently press the WRONG BUTTON: a RESUME would
+  # hand back an old remembered speed when the driver expected the one they just chose.
+  assert isinstance(direction, ast.Attribute) and direction.attr == "mode", (
+    f"dir must be published from the brain's mode, got {ast.dump(direction)}")
+  assert {m for m in ("res", "set")} == set(M.RESUME_MODES), (
+    "the brain must declare exactly the two modes the executor's parser accepts")
   withdraw = next(c for c in pubs if isinstance(c.args[1], ast.Dict) and not c.args[1].keys)
   assert withdraw is not None, "there must be an explicit empty-dict withdrawal"
 
@@ -790,7 +861,7 @@ def test_arm_without_the_brake_down_refuses():
   frame), but a future arming path must not be able to hand this feature a non-brake episode."""
   d = Drive()
   d.tick(50)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
+  d.tick(400, lateral_only=True, op_enabled=False, cruise_enabled=False, set_speed_ms=0.0)
   assert not d.fired()
   assert d.reasons("refuse") == ["noBrake"]
 
@@ -811,7 +882,10 @@ def test_verify_flags_a_resume_that_came_back_too_LOW_as_well():
 # ---------------------------------------------------------------------------------------------
 
 def test_every_arm_produces_exactly_one_terminal_record():
-  for kw in ({}, {"has_lead": True, "d_rel": 15.0, "v_lead": SET}, {"gas_pressed": True},
+  # NOTE: {"gas_pressed": True} is deliberately absent. Since gasset2pnw a held accelerator keeps
+  # the episode alive on purpose (the driver is still choosing the speed), so it has no terminal
+  # record until they lift off -- covered by test_the_arm_survives_a_long_acceleration.
+  for kw in ({}, {"has_lead": True, "d_rel": 15.0, "v_lead": SET},
              {"has_lead": None}, {"set_speed_ms": SET + 3.0}):
     d = normal_brake_and_resume(**kw)
     terminal = [r for r in d.records if r["phase"] in ("fire", "refuse")]
@@ -837,7 +911,7 @@ def test_records_survive_nonfinite_inputs():
   d = Drive()
   d.tick(50)
   d.tick(20, lateral_only=True, op_enabled=False, cruise_enabled=False, brake_pressed=True, set_speed_ms=0.0)
-  d.tick(300, lateral_only=True, op_enabled=False, cruise_enabled=False,
+  d.tick(400, lateral_only=True, op_enabled=False, cruise_enabled=False,
          set_speed_ms=float("nan"), v_ego=float("nan"), has_lead=True,
          d_rel=float("inf"), v_lead=float("nan"))
   import json

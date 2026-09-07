@@ -112,6 +112,17 @@ SET_MAX_MS = 45.0                    # ~100 mph
 # One Ford SET tap is 1 mph; tolerate under half of one so our own comparison can never trip on
 # quantisation, while a real driver/PCM change of a full step still trips it.
 SET_TOL_MS = 0.4 * 0.44704
+# gasset2pnw: a SET establishes a new speed rather than restoring a remembered one. The PCM rounds
+# to the nearest mph (0.22 m/s) and the truck keeps moving between our sample and the tap landing,
+# so the verify tolerance has to cover both. This is a REPORTING tolerance only -- it decides
+# whether the log calls the outcome "ok", and gates nothing.
+SET_MODE_TOL_MS = 1.0
+# The two wire values `ResumeDecision.mode` may take, and the exact set the executor's parser
+# accepts (opendbc icbm_pnw.RESUME_DIR / SET_DIR). Pinned by the wire-contract test: the brain and
+# the executor live in different repos with only a JSON mem-param between them, and a drift here
+# fails SILENTLY -- the executor parses None and simply never presses, which looks identical to
+# "the gates refused".
+RESUME_MODES = ("res", "set")
 
 # Gate 5 — lead / TTC. Resuming hands speed back to stock ACC, which will then ACCELERATE toward
 # the set speed. So the bar is not "is this safe right now" but "is the road already at least as
@@ -154,7 +165,14 @@ BRAKE_DEBOUNCE_S = 0.15
 # brake, release, surge again -- a fight the driver cannot win using the one reflex they will
 # actually reach for (Gemini review 2026-09-06, finding B). It latches the same opt-out as the
 # double-tap, so a single firm brake is enough to say "stop".
-REJECT_AFTER_FIRE_S = 5.0
+#
+# MEASURED 2026-09-06, and retuned from 5.0 s because of it. On the first drive with this shipped,
+# the driver resumed cleanly at 17:55:40 and braked again at 17:55:44 -- 4.6 s later, ordinary city
+# traffic, not a rejection -- and that latched the opt-out and left the feature dead for the next
+# 30 s ("refuse: suppressed" at 17:56:03). A genuine rejection is a reflex against an acceleration
+# the driver can feel: it lands in a second or two, not five. 2.0 s still catches it and stops
+# treating normal following traffic as an opt-out.
+REJECT_AFTER_FIRE_S = 2.0
 
 # THE CROSS-CONTEXT GUARD (Gemini review 2026-09-06, finding A -- BLOCK).
 # Remembering the set speed across the cruise-off gap is what makes this feature work at all, but a
@@ -183,6 +201,17 @@ V_MAX_MARGIN_MS = 5.0        # ~11 mph of slack for a set speed traffic never le
 # refuses a resume that would command more acceleration than any brake-and-continue needs.
 RESUME_MAX_DELTA_MS = 15.0
 
+# gasset2pnw (driver request 2026-09-06): "if I have been braking and I then accelerate with the
+# gas, when I stop accelerating can't that be the speed that is then set". It is the most natural
+# form of the feature -- the driver picks the speed with the pedal they are already using, and the
+# truck simply keeps it -- and it is also the SAFEST form, because setting to the current speed
+# commands no acceleration whatsoever. Where a RESUME hands speed back to ACC and lets it climb, a
+# SET here just holds what the driver has already chosen.
+#
+# It also removes two whole classes of refusal seen on the 2026-09-06 drive: `gas` (the driver
+# using the accelerator used to ABORT the episode -- 17:10:39 and 17:57:11) and `noSet` (no
+# remembered set speed -- 17:11:00 and 17:13:42, and unreachable for the rest of a drive once it
+# happened). Neither matters here: the accelerator IS the input, and no memory is consulted.
 # Total lifetime of one arm. Lateral-only can persist indefinitely (that is the point of MADS);
 # this bounds how long a resume can still be pending behind it so a resume can never arrive
 # minutes after the brake that armed it.
@@ -231,7 +260,13 @@ class ResumeDecision:
   """What the caller should do this tick."""
   offer: bool = False              # publish the resume command
   eid: float = 0.0                 # episode id -- constant for one offer, the executor's one-shot key
-  set_ms: float = 0.0              # the driver's captured set speed (carried for the executor's own check)
+  set_ms: float = 0.0              # the target speed (carried for the executor's own check)
+  # gasset2pnw: which button this offer is for.
+  #   "res" -- tap RESUME, handing back the speed the driver had ALREADY set (accelerates).
+  #   "set" -- tap SET at the CURRENT speed, after the driver chose it with the accelerator.
+  # They are different actions with different risk: "set" commands no speed change at all, so the
+  # gates that exist to bound acceleration do not apply to it.
+  mode: str = "res"
   records: list = field(default_factory=list)   # telemetry records to append (usually empty)
 
 
@@ -299,6 +334,7 @@ class MadsResumeBrain:
     self._armed_set: float | None = None
     self._armed_set_age = 0.0
     self._released_t: float | None = None
+    self._used_gas = False          # gasset2pnw: this episode's target comes from the accelerator
     self._done = False              # once-per-event latch
     self._terminal = False          # a terminal record has already been written for this arm
     self._last_block = "init"       # the most recent binding gate, for the terminal record
@@ -365,6 +401,7 @@ class MadsResumeBrain:
       "vMax": round(self._v_max, 2) if self._v_max is not None else None,
       "vMaxAgeS": round(i.now - self._v_max_t, 1) if self._v_max is not None else None,
       "supp": bool(self._suppressed),
+      "mode": "set" if self._used_gas else "res",
       "sinceFireS": round(i.now - self._fired_t, 2) if self._fired_t is not None else None,
     }
     if extra:
@@ -380,6 +417,7 @@ class MadsResumeBrain:
 
   def _disarm(self) -> None:
     self._armed = False
+    self._used_gas = False
     self._armed_set = None
     self._armed_set_age = 0.0
     self._released_t = None
@@ -472,9 +510,12 @@ class MadsResumeBrain:
         # did not restore its remembered set, so something set a new speed. That is not dangerous
         # (it is slower), but reporting it as "ok" would hide the fact that the mechanism did not
         # behave as this whole design assumes, which is exactly the thing the log exists to catch.
-        if got > want + SET_TOL_MS:
+        # A SET establishes a NEW speed and the PCM rounds it to the nearest mph, so it cannot be
+        # held to the tolerance a RESUME is (which must land exactly on a remembered value).
+        tol = SET_MODE_TOL_MS if self._used_gas else SET_TOL_MS
+        if got > want + tol:
           reason = "setHigher"
-        elif got < want - SET_TOL_MS:
+        elif got < want - tol:
           reason = "setLower"
         else:
           reason = "ok"
@@ -566,13 +607,11 @@ class MadsResumeBrain:
         self._done = True
         self._terminate(i, out, "noBrake")
         return out
-      if self._armed_set is None:
-        # Gate 6 can never be satisfied for this arm. Refuse NOW and say so, rather than letting
-        # the window run and reporting a vaguer reason 3 s later. Name the SPECIFIC cause: if the
-        # ACC master is off, "accOff" is what a reader needs to see -- reporting the `noSet` that
-        # the master being off just caused would hide the actual reason one level down.
+      if self._armed_set is None and not i.cruise_available:
+        # The ACC master is off: neither button can do anything, so end it now and name the real
+        # cause rather than the `noSet` that the master being off just caused.
         self._done = True
-        self._terminate(i, out, "accOff" if not i.cruise_available else "noSet")
+        self._terminate(i, out, "accOff")
       return out
 
     if not self._armed:
@@ -586,10 +625,28 @@ class MadsResumeBrain:
       return out
 
     # --- gate 7: aborts. Any of these ends the arm outright (no retry until a new brake cycle). --
-    abort = None
+    # gasset2pnw: the accelerator is no longer an abort -- it is how the driver names the speed.
+    # While it is down, this episode's target switches to "whatever speed they end up at", and the
+    # release clock is held: it starts when BOTH pedals are up (gate 2 below).
     if i.gas_pressed:
-      abort = "gas"
-    elif i.blocked:
+      self._used_gas = True
+      self._released_t = None
+      self._last_block = "gas"
+      # Hold the arm alive while the driver is actually on the power. A freeway on-ramp is easily a
+      # 20 s acceleration, and ARM_MAX_S measured from the brake would expire the episode before
+      # they ever lifted off -- losing exactly the case this mode exists for. The clock therefore
+      # measures from the last moment the driver was doing something, not from the brake; once the
+      # foot comes up the ordinary 0.5-3.0 s window applies and settles it within seconds either way.
+      self._arm_t = i.now
+      if self._offer_t is not None:
+        # An offer was on the wire when the driver got on the power. Withdraw it -- they are
+        # commanding speed themselves, and the target is about to change.
+        out.records.append(self._snap(i, {"phase": "offerEnd", "reason": "gas", "fired": True}))
+        self._offer_t = None
+        self._done = False
+
+    abort = None
+    if i.blocked:
       abort = "blocked"
     elif i.op_enabled:
       abort = "opEngaged"
@@ -610,7 +667,7 @@ class MadsResumeBrain:
       return out
 
     # --- gate 2: the brake must be FULLY released before the clock starts ----------------------
-    braking = bool(i.brake_pressed) or bool(i.regen_braking)
+    braking = bool(i.brake_pressed) or bool(i.regen_braking) or bool(i.gas_pressed)
     if braking:
       # The release clock must measure a CONTINUOUS release. A re-press that BRAKE_DEBOUNCE_S
       # swallowed as chatter is still braking, however long it is then held -- without this reset a
@@ -633,9 +690,14 @@ class MadsResumeBrain:
     if self._offer_t is not None:
       block = self._gates(i)
       if block is None and (i.now - self._offer_t) <= OFFER_S:
+        out.mode = "set" if self._used_gas else "res"
         out.offer = True
         out.eid = self._eid
-        out.set_ms = float(self._armed_set)
+        # Re-publish the target SAMPLED AT FIRE, never a live value. For a resume the two are the
+        # same, but for a gas-set they are not: `_armed_set` may be a stale capture or None, and
+        # re-deriving it here would republish the wrong speed for every tick the offer stands (and
+        # raise on None). One episode, one target, fixed the moment it fired.
+        out.set_ms = float(self._verify_set)
         return out
       # Offer over. Record why, and stop offering. `_done` stays set: no second offer.
       out.records.append(self._snap(i, {
@@ -668,20 +730,22 @@ class MadsResumeBrain:
     self._offer_t = i.now
     self._fired_t = i.now
     self._verify_until = i.now + VERIFY_S
-    self._verify_set = float(self._armed_set)
+    # gasset2pnw: the target is the speed the driver just chose with the accelerator, sampled once
+    # here and never moved afterwards -- exactly as _armed_set is for a resume.
+    target = float(i.v_ego) if self._used_gas else float(self._armed_set)
+    self._verify_set = target
     self._terminal = True          # "fire" IS this arm's terminal record
     out.records.append(self._snap(i, {"phase": "fire", "reason": None, "fired": True}))
     out.offer = True
     out.eid = self._eid
-    out.set_ms = float(self._armed_set)
+    out.set_ms = target
+    out.mode = "set" if self._used_gas else "res"
     return out
 
   def _gates(self, i: ResumeInputs) -> str | None:
     """The gates that are re-evaluated every tick of the window AND every tick of the offer.
     Returns None (clear) or the name of the binding gate. Ordered cheapest/most-fundamental first
     so the reported reason is the most informative one."""
-    if self._armed_set is None:
-      return "noSet"                                    # gate 6 (already terminal at arm, defensive)
     if not _finite(i.v_ego) or float(i.v_ego) < V_EGO_MIN_MS or i.standstill:
       return "slow"
     # Fable A1 (HIGH), and the single most important gate that was MISSING: openpilot's own state
@@ -696,6 +760,17 @@ class MadsResumeBrain:
     # STEERING away. Fail-to-stock in direction, but caused by this feature and entirely avoidable.
     if not i.engageable:
       return "noEntry"
+    # gasset2pnw: SET at the CURRENT speed commands no speed change at all, so every gate below --
+    # `noSet`, `setRaised`, `setFar`, `staleContext` and the lead gate, all of which exist purely to
+    # bound how much ACCELERATION a resume may ask stock ACC for -- is inapplicable by construction.
+    # Refusing here would deny the driver cruise over a risk this mode cannot create. Note what is
+    # still enforced above and below: the speed floor, openpilot's own engageability, and (in the
+    # abort chain and again independently in the executor) that stock cruise is not already engaged,
+    # since a SET tap while engaged would move the driver's set speed rather than establish it.
+    if self._used_gas:
+      return None
+    if self._armed_set is None:
+      return "noSet"                                    # gate 6
     # gate 6, live half: the truck must not be reporting a set speed ABOVE the one we captured.
     # A LOWER reported set is fine -- resume would go there, which is still not above the driver's,
     # and an absent/zero reading is expected (the Lightning may report 0 in ACC standby).
