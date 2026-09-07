@@ -174,7 +174,7 @@ class MadsPnw:
     self._brake_grace = 0
 
   def update(self, op_enabled: bool, op_active: bool, braking: bool, cruise_enabled: bool,
-             events: Events) -> None:
+             events: Events, cruise_available: bool = True) -> None:
     """Run once per frame, AFTER selfdrived's own state machine has already decided op_enabled.
 
     op_enabled/op_active: selfdrived's own engagement, untouched by this module.
@@ -182,6 +182,8 @@ class MadsPnw:
     cruise_enabled:       CS.cruiseState.enabled — openpilot's view of what drives the panda's
                           own `controls_allowed` on a pcmCruise car. See the revoke check below.
     events:               this frame's events, read only.
+    cruise_available:     CS.cruiseState.available — the ACC MASTER switch (CcStat_D_Actl in 3/4/5).
+                          onebutton2pnw: the master switch turns EVERYTHING off, lateral included.
     """
     # The panda sets controls_allowed on the RISING edge of stock cruise engaging. If cruise
     # engages and openpilot does NOT engage with it — a NO_ENTRY is standing (calibration
@@ -194,6 +196,20 @@ class MadsPnw:
     # (Found by the Fable review, 2026-09-05.)
     cruise_engage_edge = cruise_enabled and not self._cruise_enabled_prev
     self._cruise_enabled_prev = cruise_enabled
+
+    # onebutton2pnw (driver request 2026-09-06): the cruise button is the MASTER, for both halves.
+    # Before this, turning ACC off while MADS held lateral left the truck steering with the cruise
+    # system switched off -- the driver's "weird three-state state", a hands-free light with no
+    # cruise behind it. The button now means what it says: off is off. This is purely
+    # de-authorizing, and it is checked before everything else so no later branch can re-arm.
+    if not cruise_available:
+      self._op_enabled_prev = op_enabled
+      self._cruise_enabled_prev = cruise_enabled
+      self._brake_grace = 0
+      self.enabled = False
+      self.active = False
+      self.lateral_only = False
+      return
 
     if not self.available:
       # Inert. Hold every output at False so `madsState` can never be mistaken for authority,

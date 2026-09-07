@@ -685,7 +685,7 @@ class SelfdriveD:
     # self.enabled, reset above) cannot climb because of this, and controlsMismatch cannot fire.
     # MADS only answers the separate question "may openpilot still steer?".
     self.mads.update(self.enabled, self.active, CS.brakePressed or CS.regenBraking,
-                     CS.cruiseState.enabled, self.events)
+                     CS.cruiseState.enabled, self.events, CS.cruiseState.available)
     # madsresume2pnw: decide (never act -- the tap itself is the ford carcontroller's job) whether
     # openpilot may hand back the speed the driver had already set. Runs AFTER mads.update so it
     # sees THIS frame's lateral_only, not the previous one -- the arm edge must not be a frame late.
@@ -793,7 +793,9 @@ class SelfdriveD:
             self.mads_resume_pub_t = now
             self.mads_resume_offered = True
             self.mads_resume_mem.put_nonblocking("MadsResumeTarget", {
-              "dir": "res",
+              # gasset2pnw: "res" taps RESUME (hand back the driver's remembered set speed);
+              # "set" taps SET at the speed they just chose with the accelerator.
+              "dir": out.mode,
               # MONOTONIC, not wall clock (Gemini review 2026-09-06). CLOCK_MONOTONIC is shared
               # across processes on this host, so the executor can compare against its own
               # time.monotonic(); wall clock could not be trusted for a 0.5 s freshness bound on a
