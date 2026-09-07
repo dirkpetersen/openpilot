@@ -71,25 +71,42 @@ RELEASE_MAX_S = 3.0
 OFFER_S = 1.0
 
 # Gate 6 — the captured set speed.
-# The capture is refreshed on EVERY tick stock cruise reports enabled, so at arm time it is
-# normally a few frames old. The bound must cover the ONE legitimate delay: MADS's brake-grace
-# window (mads_pnw.MADS_BRAKE_GRACE_FRAMES = 45 frames = 0.45 s, the MEASURED pedal lead, during
-# which the PCM has already dropped cruise but `brakePressed` has not yet landed -- so the capture
-# has stopped refreshing while the arm has not yet happened) plus PCM/decode lag.
+# The capture is refreshed on EVERY tick stock cruise reports enabled, and is REMEMBERED across the
+# cruise-off gap that the brake itself creates. That memory is the whole point: the driver's set
+# speed does not stop existing because their foot touched the brake pedal.
 #
-# It is NOT a round number, on purpose (Gemini review 2026-09-06): every extra 100 ms of slack is
-# 100 ms in which a cruise drop from some OTHER cause could be mistaken for this brake's. The
-# specific attack -- driver cancels cruise on the stalk, then brakes a beat later, and we resume to
-# the speed they just deliberately cancelled -- is already blocked one layer up (a stalk CANCEL is
-# NOT in mads_pnw.MADS_TOLERATED_EVENTS, so `blocked` is True at the falling edge and MADS refuses
-# to arm at all), but sizing this bound to the mechanism rather than to a round second removes the
-# slack instead of leaning on that. 0.45 s grace + 0.30 s margin.
-# COUPLED to MADS_BRAKE_GRACE_FRAMES. This module deliberately does not import mads_pnw (that would
-# drag in cereal and end its purity), so the coupling is pinned by
-# test_capture_age_bound_covers_the_mads_brake_grace_window instead.
-SET_MAX_AGE_S = 0.75
-# Ford's ACC will not hold a set speed below 20 mph, so a "set speed" under it is not a real one.
-SET_MIN_MS = 20.0 * 0.44704          # 8.94 m/s
+# It used to expire 0.75 s after the last engaged frame, sized to cover only MADS's brake-grace
+# window. That was wrong, and the 2026-09-06 truck drive shows exactly how (drives/2026-09-06/):
+# three brake episodes, and the capture was valid for only the FIRST one. Once a resume misses for
+# any reason, stock cruise stays off, so nothing refreshes the capture -- and every later brake for
+# the rest of the drive refused with `noSet` (observed setAgeS 22.15 s, then -1.0 = never captured).
+# The feature could fail exactly once and was then dead until the driver manually re-engaged cruise,
+# which is the thing the driver was asking not to have to do.
+#
+# Why lengthening this does NOT reopen the hazard it was sized against: the specific attack -- driver
+# cancels cruise on the stalk, then brakes a beat later, and we resume to the speed they just
+# deliberately cancelled -- is blocked ONE LAYER UP and always was. A stalk CANCEL is not in
+# mads_pnw.MADS_TOLERATED_EVENTS, so `blocked` is True at the falling edge and MADS refuses to hand
+# this module a lateral-only episode at all. The 0.75 s bound was belt-and-braces on top of a gate
+# that already holds; removing the braces does not remove the belt.
+#
+# What remains is a genuine, bounded residual: a set speed captured on a fast road, remembered while
+# the driver steers a long way on MADS lateral without cruise, and resumed somewhere it no longer
+# suits. Three things bound it -- this 10-minute backstop, clearing the memory the moment the ACC
+# master goes off (`cruise_available` False, i.e. the driver switched cruise off entirely), and the
+# fact that a resume can never target ABOVE what the driver themselves last set.
+SET_MAX_AGE_S = 600.0
+# Sanity floor on a CAPTURED set speed -- it rejects a decode fault, it does not impose policy.
+#
+# This used to be 20 mph, justified as "Ford's ACC will not hold a set speed below 20 mph". That is
+# FALSE for this truck, and it was silently refusing the driver's real city speeds. Two independent
+# checks, 2026-09-06:
+#   * opendbc/car/ford/interface.py:105 sets minEnableSpeed = 20 mph only on the MANUAL-transmission
+#     branch. The Lightning is automatic, so that limit never applied to it.
+#   * measured on the truck's own log: stock ACC was ENGAGED with set speeds of 15, 16, 17, 18 and
+#     19 mph (34 ticks, minimum 6.71 m/s). The car plainly holds a set speed below 20 mph.
+# 5.0 m/s (~11 mph) sits below every engaged set speed actually observed, with margin.
+SET_MIN_MS = 5.0
 # Sanity ceiling — a reading above this is a decode fault, not a driver intent.
 SET_MAX_MS = 45.0                    # ~100 mph
 # One Ford SET tap is 1 mph; tolerate under half of one so our own comparison can never trip on
@@ -110,9 +127,61 @@ LEAD_MIN_HEADWAY_S = 2.0
 LEAD_MIN_TTC_S = 8.0
 LEAD_MIN_DIST_M = 20.0
 
-# Speed floor. Below Ford's own ACC minimum there is no valid set speed to resume to, and a
-# low-speed brake is stop-and-go, not the highway case this feature exists for.
-V_EGO_MIN_MS = SET_MIN_MS
+# Speed floor for actually resuming. Kept equal to the capture floor rather than DERIVED from it,
+# so that changing one does not silently move the other. Below ~11 mph a brake-and-release is
+# creeping in stop-and-go, where handing speed back to ACC is a surprise; `standstill` is gated
+# separately. Note this is a POLICY floor -- the lead gate (20 m absolute) is what actually protects
+# the low-speed case, and it is unchanged.
+V_EGO_MIN_MS = 5.0
+
+# brakeretry2pnw: the driver's OPT-OUT. Two brake presses inside this window mean "no, leave
+# longitudinal off" -- auto-resume is then suppressed until the driver themselves brings cruise back
+# (a manual RES, or any SET+/SET- adjustment; both engage stock cruise, which is the clear signal).
+#
+# This exists BECAUSE arming now happens on every brake press. Without it the driver has no way to
+# say "stay off": each press would open another resume opportunity, and a driver who genuinely wants
+# cruise gone would be arguing with the feature. One deliberate double-tap is a clearer, faster
+# statement of intent than any toggle, and it is available in the moment, with the foot already
+# there. A single press keeps its plain meaning ("slow down, then carry on"), which is the common
+# case, so the opt-out costs the common case nothing.
+DOUBLE_BRAKE_S = 1.0
+# Pedal BOUNCE filter. Two edges closer together than this are one press that chattered, not two
+# presses -- counting them as a double-tap would silently kill the feature on a rough road, and
+# counting them as two arms would re-arm on chatter (Gemini review 2026-09-06, finding C).
+BRAKE_DEBOUNCE_S = 0.15
+# A brake press this soon after WE resumed is the driver REJECTING that resume, not asking for
+# another one. Without it, braking to cancel an unwanted resume immediately queues the next one:
+# brake, release, surge again -- a fight the driver cannot win using the one reflex they will
+# actually reach for (Gemini review 2026-09-06, finding B). It latches the same opt-out as the
+# double-tap, so a single firm brake is enough to say "stop".
+REJECT_AFTER_FIRE_S = 5.0
+
+# THE CROSS-CONTEXT GUARD (Gemini review 2026-09-06, finding A -- BLOCK).
+# Remembering the set speed across the cruise-off gap is what makes this feature work at all, but a
+# memory with only a time bound is a loaded gun: set 70 mph on the freeway, exit, drive several
+# minutes on MADS lateral through town, brake and release at 15 mph -- and a purely time-bounded
+# memory would hand the truck back a 70 mph target on a residential street. The lead gate is no
+# protection there, because an empty street has no lead.
+#
+# Time alone cannot separate that from the case the driver actually wants, so this does not try.
+# The discriminator is whether the captured set speed is a speed THIS DRIVE HAS RECENTLY BEEN DOING.
+# `_v_max` is an approximate rolling maximum of v_ego over the last V_MAX_WINDOW_S; a resume is
+# refused when the captured set speed stands more than V_MAX_MARGIN_MS above it.
+#   * brake hard 70 -> 40 for traffic, release:   recent max 70, set 70   -> PASS (the main case)
+#   * following a slow lead at 20 with set 31:    recent max ~31          -> PASS
+#   * set above what traffic ever allowed:        margin covers it        -> PASS
+#   * freeway memory used in a 25 mph town:       recent max ~7, set 31   -> REFUSE
+# It also bounds finding D: it caps how much ACCELERATION any resume can command, since the target
+# can never stand far above a speed the truck has just been holding.
+V_MAX_WINDOW_S = 60.0
+V_MAX_MARGIN_MS = 5.0        # ~11 mph of slack for a set speed traffic never let the truck reach
+# The ABSOLUTE cap, and the primary bound on uncommanded acceleration (Fable review 2026-09-06, A1).
+# `staleContext` alone is time-scoped, so it still permits the freeway-exit-then-yield case: brake
+# 70 -> 25 mph down a ramp, release at the yield onto an arterial, and RES targets 70 from 15 mph
+# with cross traffic and no lead to gate on. Time cannot separate that from "braked 70 -> 40 for
+# traffic"; the SIZE OF THE JUMP can. 15 m/s (~34 mph) clears a hard brake from the set speed and
+# refuses a resume that would command more acceleration than any brake-and-continue needs.
+RESUME_MAX_DELTA_MS = 15.0
 
 # Total lifetime of one arm. Lateral-only can persist indefinitely (that is the point of MADS);
 # this bounds how long a resume can still be pending behind it so a resume can never arrive
@@ -204,16 +273,21 @@ class MadsResumeBrain:
 
   Lifecycle of ONE brake event:
       (continuously) capture the driver's set speed while stock cruise is enabled
-      lateralOnly rising edge          -> ARM   (record "arm")
+      lateralOnly rising edge, OR any
+        later brake press while it holds -> ARM   (record "arm")
       brake+regen both released        -> the release clock starts
       RELEASE_MIN_S..RELEASE_MAX_S     -> if every gate passes: OFFER (record "fire"), latch _done
       offer ends                       -> record "offerEnd"
       window passes without an offer   -> record "refuse" naming the binding gate
       cruise comes back within VERIFY_S-> record "verify" (LOUD if it came back above the capture)
-      lateralOnly falls                -> DISARM; only a NEW lateralOnly rising edge can arm again
+      lateralOnly falls                -> DISARM
 
-  `_done` is the once-per-event latch (requirement 4): it is set at offer start and cleared ONLY
-  by a disarm, which requires lateral_only to go False. A failed press does not get a retry."""
+  `_done` is the once-per-EPISODE latch: one brake press gets one press attempt, and it is cleared
+  by a disarm. Since brakeretry2pnw a disarm no longer requires lateral_only to go False -- the next
+  brake press starts a fresh episode. So a failed attempt does not get a retry *within* that press,
+  but the driver always gets another attempt simply by braking again, which is the driver's own
+  stated rule ("I can always push the brake"). The set-speed capture is REMEMBERED across all of
+  this; see SET_MAX_AGE_S for why it must be, and what bounds it."""
 
   def __init__(self):
     # continuous set-speed capture
@@ -241,6 +315,20 @@ class MadsResumeBrain:
     # transition having been observed at all: precisely outside the bounded state. The first
     # observation now only SEEDS the detector; arming needs a genuine False->True after that.
     self._lat_prev = None
+    # brakeretry2pnw double-tap opt-out: time of the last brake rising edge, and the latch it sets.
+    self._last_brake_t: float | None = None
+    self._suppressed = False
+    # Pedal-only edge detector (regen deliberately excluded -- see the edge block in update()).
+    # THREE-STATE like _lat_prev: None = never observed.
+    self._pedal_prev = None
+    self._pedal_off_t: float | None = None
+    # when our own resume last fired, for the post-resume rejection check
+    self._fired_t: float | None = None
+    # cruise_enabled edge detector, for clearing the opt-out. THREE-STATE like _lat_prev.
+    self._cc_prev = None
+    # approximate rolling max of v_ego, for the cross-context guard
+    self._v_max: float | None = None
+    self._v_max_t = 0.0
     # diagnostics: how many times update() raised inside the caller's guard (caller-owned counter
     # lives in selfdrived; this one just proves the brain itself ran).
     self.ticks = 0
@@ -273,6 +361,11 @@ class MadsResumeBrain:
       "ccOn": bool(i.cruise_enabled), "ccAvail": bool(i.cruise_available),
       "blocked": bool(i.blocked), "latOnly": bool(i.lateral_only),
       "opEn": bool(i.op_enabled), "engbl": bool(i.engageable), "eid": self._eid,
+      # without these a staleContext/setFar refusal cannot be re-derived from the record
+      "vMax": round(self._v_max, 2) if self._v_max is not None else None,
+      "vMaxAgeS": round(i.now - self._v_max_t, 1) if self._v_max is not None else None,
+      "supp": bool(self._suppressed),
+      "sinceFireS": round(i.now - self._fired_t, 2) if self._fired_t is not None else None,
     }
     if extra:
       rec.update(extra)
@@ -309,6 +402,14 @@ class MadsResumeBrain:
       # while lateral_only is already True is exactly what would manufacture a rising edge on the
       # tick the driver flips the toggle back on (Gemini review 2026-09-06).
       self._lat_prev = bool(i.lateral_only)
+      self._last_brake_t = None
+      self._suppressed = False
+      self._pedal_prev = bool(i.brake_pressed)
+      self._pedal_off_t = None
+      self._fired_t = None
+      self._v_max = None
+      self._v_max_t = 0.0
+      self._cc_prev = bool(i.cruise_enabled)
       self._set_ms = None
       self._set_t = None
       self._verify_until = None
@@ -319,11 +420,41 @@ class MadsResumeBrain:
     # --- continuous capture of the driver's OWN set speed (gate 6's only source) ----------------
     # Refreshed on every tick stock cruise reports engaged. This is the ONLY place _set_ms is
     # written, so it can never pick up a value from a frame where cruise was off.
+    # --- rolling max of v_ego, for the cross-context guard ---------------------------------------
+    # Approximate by design: hold the max, and let it expire to the current speed once it is older
+    # than the window. That is one comparison per tick and needs no buffer. A NON-FINITE v_ego does
+    # not update it (and the gate below refuses outright on one), so a bad read can never inflate
+    # the ceiling and thereby permit a resume it should have refused.
+    if _finite(i.v_ego):
+      v = float(i.v_ego)
+      if self._v_max is None or v >= self._v_max or (i.now - self._v_max_t) > V_MAX_WINDOW_S:
+        self._v_max = v
+        self._v_max_t = i.now
+
+    cc_rising = bool(i.cruise_enabled) and self._cc_prev is False
+    self._cc_prev = bool(i.cruise_enabled)
+    if cc_rising:
+      # The driver has cruise engaged again -- by a manual RES, by a SET+/SET- adjustment, or
+      # because our own press landed. Whichever it was, the opt-out is spent.
+      #
+      # RISING EDGE, not level (Fable review 2026-09-06, P2). On the level, a single frame where
+      # cruiseState.enabled still reads True after the driver's rejection brake wipes `_suppressed`
+      # immediately -- and the truck resumes again, which is precisely the unwinnable fight the
+      # opt-out exists to end. mads_pnw.py:235-237 states the PCM ordering is not guaranteed, so
+      # that frame is not hypothetical.
+      self._suppressed = False
+      self._last_brake_t = None
     if i.cruise_enabled and _finite(i.set_speed_ms):
       s = float(i.set_speed_ms)
       if SET_MIN_MS <= s <= SET_MAX_MS:
         self._set_ms = s
         self._set_t = i.now
+    elif not i.cruise_available:
+      # The ACC master switch is OFF -- the driver has turned cruise off entirely, not merely had it
+      # dropped by the brake. Whatever they had set is no longer "the speed they set"; forget it now
+      # rather than letting the 10-minute backstop carry it across an explicit switch-off.
+      self._set_ms = None
+      self._set_t = None
 
     # --- post-press verification (runs independently of arm/disarm) ----------------------------
     if self._verify_until is not None:
@@ -355,14 +486,64 @@ class MadsResumeBrain:
           out.records[-1]["loud"] = True
         self._verify_until = None
 
-    # --- arm / disarm on the lateral-only edge (gate 1) ----------------------------------------
+    # --- arm on the lateral-only edge OR on any later brake press (gate 1) ---------------------
     lat = bool(i.lateral_only)
     # `is False`, not `not self._lat_prev`: a None (never-observed) previous state must NOT
     # produce a rising edge -- see the _lat_prev comment in __init__.
-    rising = lat and self._lat_prev is False
+    lat_rising = lat and self._lat_prev is False
     self._lat_prev = lat
 
-    if rising:
+    # Brake EDGE detection -- for re-arming AND for the opt-out -- reads the PEDAL ONLY, never
+    # regen. Regen braking flickers as the driver modulates, and every flicker would be an "edge":
+    # that would manufacture both spurious re-arms and spurious double-taps (Gemini review
+    # 2026-09-06, finding C). Gating and the arm precondition still use brake-or-regen; this is
+    # only about detecting a discrete PRESS.
+    pedal = bool(i.brake_pressed)
+    pedal_rising = pedal and self._pedal_prev is False
+    if pedal_rising and self._pedal_off_t is not None and (i.now - self._pedal_off_t) < BRAKE_DEBOUNCE_S:
+      pedal_rising = False                      # chatter within one press, not a second press
+    if self._pedal_prev is not False and not pedal:
+      self._pedal_off_t = i.now                 # pedal just came up (or first observation, released)
+    self._pedal_prev = pedal
+
+    # brakeretry2pnw: the opt-out. Evaluated on the brake EDGE, before arming, so a second press
+    # suppresses rather than re-arms.
+    if pedal_rising:
+      double = self._last_brake_t is not None and (i.now - self._last_brake_t) <= DOUBLE_BRAKE_S
+      post_resume = self._fired_t is not None and (i.now - self._fired_t) <= REJECT_AFTER_FIRE_S
+      if double or post_resume:
+        self._suppressed = True
+        why = "doubleBrake" if double else "postResumeBrake"
+        # Rule 2: a feature that quietly stops acting is exactly the thing that must say so.
+        out.records.append(self._snap(i, {"phase": "suppress", "reason": why, "fired": False}))
+        if self._armed:
+          # An episode was open. The driver has just overruled it; end it now rather than letting
+          # its window keep running behind the opt-out they just asked for.
+          self._terminate(i, out, why)
+          self._disarm()
+      self._last_brake_t = i.now
+
+    # brakeretry2pnw: EVERY brake press while MADS is holding lateral opens a resume opportunity,
+    # not only the first one after cruise dropped. Before this, arming required the RISING EDGE of
+    # lateral_only, which can happen only once per cruise-off transition -- so if that single
+    # attempt refused for any reason (the 2026-09-06 drive refused on `gas` one second in), there
+    # was no second chance until the driver manually re-engaged cruise to create a new edge. The
+    # driver's rule is "I can always push the brake", and this is that rule: press, release, resume.
+    if pedal_rising and lat and self._suppressed:
+      # Rule 2: this is a no-resume class of its own, and the whole 2026-09-06 investigation was
+      # about diagnosing a no-resume. Silence here would recreate exactly that problem.
+      out.records.append(self._snap(i, {"phase": "refuse", "reason": "suppressed", "fired": False}))
+
+    start = (lat_rising or (lat and pedal_rising)) and not self._suppressed
+
+    if start:
+      if self._armed:
+        # A previous episode is still open. _terminate() is a no-op if its terminal record was
+        # already written, so this cannot double-report -- but an arm still inside its window has
+        # NO terminal record yet, and dropping it silently would break the one-terminal-record-per
+        # -arm contract in the class docstring (Fable review 2026-09-06, P4).
+        self._terminate(i, out, "reBrake")
+        self._disarm()
       # ARM. Snapshot the captured set speed and its age RIGHT HERE -- nothing after this point may
       # move _armed_set, so the target can never drift after the driver's foot left the brake.
       self._armed = True
@@ -387,9 +568,11 @@ class MadsResumeBrain:
         return out
       if self._armed_set is None:
         # Gate 6 can never be satisfied for this arm. Refuse NOW and say so, rather than letting
-        # the window run and reporting a vaguer reason 3 s later.
+        # the window run and reporting a vaguer reason 3 s later. Name the SPECIFIC cause: if the
+        # ACC master is off, "accOff" is what a reader needs to see -- reporting the `noSet` that
+        # the master being off just caused would hide the actual reason one level down.
         self._done = True
-        self._terminate(i, out, "noSet")
+        self._terminate(i, out, "accOff" if not i.cruise_available else "noSet")
       return out
 
     if not self._armed:
@@ -418,10 +601,6 @@ class MadsResumeBrain:
       abort = "ccOn"
     elif i.now - self._arm_t > ARM_MAX_S:
       abort = "armExpired"
-    elif self._released_t is not None and (i.brake_pressed or i.regen_braking):
-      # Re-braking AFTER a full release is "any further pedal input" (requirement 7). One brake
-      # event gets one release clock; a second press is a new situation, and this arm is done.
-      abort = "reBrake"
     if abort is not None:
       if self._offer_t is not None:
         # An offer was on the wire; say so explicitly rather than letting it vanish from the log.
@@ -433,6 +612,14 @@ class MadsResumeBrain:
     # --- gate 2: the brake must be FULLY released before the clock starts ----------------------
     braking = bool(i.brake_pressed) or bool(i.regen_braking)
     if braking:
+      # The release clock must measure a CONTINUOUS release. A re-press that BRAKE_DEBOUNCE_S
+      # swallowed as chatter is still braking, however long it is then held -- without this reset a
+      # fire can land 50 ms after the real release, skipping the settle the window exists to
+      # enforce. The old `reBrake` abort used to guarantee this for free (Fable review, P1).
+      self._released_t = None
+      if self._offer_t is not None:
+        out.records.append(self._snap(i, {"phase": "offerEnd", "reason": "braking", "fired": True}))
+        self._offer_t = None
       self._last_block = "braking"
       return out
     if self._released_t is None:
@@ -479,6 +666,7 @@ class MadsResumeBrain:
     # --- FIRE. Latch first, offer second. -------------------------------------------------------
     self._done = True
     self._offer_t = i.now
+    self._fired_t = i.now
     self._verify_until = i.now + VERIFY_S
     self._verify_set = float(self._armed_set)
     self._terminal = True          # "fire" IS this arm's terminal record
@@ -518,4 +706,10 @@ class MadsResumeBrain:
       return "setUnknown"
     if float(i.set_speed_ms) > 0.0 and float(i.set_speed_ms) > self._armed_set + SET_TOL_MS:
       return "setRaised"
+    # the cross-context guard -- see V_MAX_WINDOW_S. An absent rolling max is a REFUSAL, not a pass:
+    # the gate cannot be evaluated, and this is the gate that bounds uncommanded acceleration.
+    if self._armed_set - float(i.v_ego) > RESUME_MAX_DELTA_MS:
+      return "setFar"
+    if self._v_max is None or self._armed_set > self._v_max + V_MAX_MARGIN_MS:
+      return "staleContext"
     return lead_gate(i.has_lead, i.d_rel, i.v_lead, i.v_ego)     # gate 5
