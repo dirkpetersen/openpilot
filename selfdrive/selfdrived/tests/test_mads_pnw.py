@@ -830,6 +830,41 @@ class TestBrakeArrivesLate:
     m.update(False, False, True, False, self._ev(EventName.pcmDisable))    # brake lands
     assert m.enabled and m.lateral_only, "late brake must arm lateral-only"
 
+  def test_off_request_drops_lateral_from_the_steering_only_state(self):
+    """onebutton2pnw. MEASURED 2026-09-07 (drives/2026-09-07/lightning-onoff-button/): from Standby
+    -- exactly the state the truck sits in while MADS steers after a brake -- the ACC ON/OFF button
+    NEVER reaches Off. Four presses there: two did nothing, two turned the system ON, zero produced
+    Off. So `cruise_available` stays True and cannot be the signal; the PRESS has to be."""
+    from openpilot.selfdrive.selfdrived.events import EventName
+    m = self._mads()
+    m.update(True, True, False, True, self._no_ev())                       # engaged
+    m.update(False, False, True, False, self._ev(EventName.pcmDisable))    # brake -> steering only
+    assert m.lateral_only, "precondition: MADS is holding lateral"
+    # the driver presses ON/OFF. The truck stays in Standby, so cruise_available is STILL True.
+    m.update(False, False, False, False, self._no_ev(), True, True)
+    assert not m.enabled and not m.lateral_only and not m.active, "the press must turn steering off"
+
+  def test_off_request_is_what_works_where_available_cannot(self):
+    """The same drive, without the press: available stays True in Standby, so nothing drops."""
+    from openpilot.selfdrive.selfdrived.events import EventName
+    m = self._mads()
+    m.update(True, True, False, True, self._no_ev())
+    m.update(False, False, True, False, self._ev(EventName.pcmDisable))
+    assert m.lateral_only
+    m.update(False, False, False, False, self._no_ev(), True, False)       # no press
+    assert m.lateral_only, "without the press, steering-only correctly persists"
+
+  def test_master_off_still_drops_lateral(self):
+    """The other half of onebutton2pnw, unchanged: reaching Off (available False) also drops it.
+    That path IS reachable from Active, verified on the same drive at t=135.9 and t=155.5."""
+    from openpilot.selfdrive.selfdrived.events import EventName
+    m = self._mads()
+    m.update(True, True, False, True, self._no_ev())
+    m.update(False, False, True, False, self._ev(EventName.pcmDisable))
+    assert m.lateral_only
+    m.update(False, False, False, False, self._no_ev(), False, False)      # CcStat -> Off
+    assert not m.enabled and not m.lateral_only
+
   def test_cancel_button_without_brake_never_arms(self):
     """A cancel-button disengage has no brake: the window must expire and stay off."""
     from openpilot.selfdrive.selfdrived.mads_pnw import MADS_BRAKE_GRACE_FRAMES

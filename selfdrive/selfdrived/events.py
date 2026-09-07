@@ -520,6 +520,20 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # still live. A permanent banner because the one thing this feature must never do is steer behind
   # a UI that says "disengaged". ET.PERMANENT ONLY: it carries no disable/no-entry type, so adding
   # it after the state machine has run cannot influence engagement. Display only, no control path.
+  # onebutton2pnw: the driver pressed the ACC ON/OFF button while openpilot was steering with cruise
+  # in Standby, i.e. asking for EVERYTHING off. NO_ENTRY is what makes that stick: the truck answers
+  # that press by ENGAGING about half the time (measured -- see
+  # drives/2026-09-07/lightning-onoff-button/), and on a pcmCruise car openpilot would then engage
+  # with it and bring everything back. Refusing entry for a moment lets controlsd's existing
+  # `cruiseState.enabled and not CC.enabled` rule send the cancel, so off actually means off.
+  #
+  # It carries a REAL alert, not a silent one: a NO_ENTRY that says nothing is indistinguishable
+  # from a feature that quietly stopped working, which is the failure mode this whole effort keeps
+  # running into.
+  EventName.cruiseOffRequested: {
+    ET.NO_ENTRY: NoEntryAlert("Cruise turned off"),
+  },
+
   EventName.madsLateralOnly: {
     ET.PERMANENT: Alert(
       "Steering only",
