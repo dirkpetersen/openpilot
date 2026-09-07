@@ -498,7 +498,24 @@ class Tici(HardwareBase):
 
     # eSIM prime
     dest = "/etc/NetworkManager/system-connections/esim.nmconnection"
-    if self.get_sim_lpa().is_comma_profile(sim_id) and not os.path.exists(dest):
+    try:
+      prime = self.get_sim_lpa().is_comma_profile(sim_id)
+    except Exception as e:
+      # Deliberately broad. get_sim_lpa() constructs TiciLPA, which opens the modem serial
+      # port and selects the eUICC ISD-R applet (AT+CCHO). On a device running a physical SIM
+      # there is no eUICC, so the modem answers ERROR and lpa raises RuntimeError. A serial,
+      # dbus, or timeout failure is treated the same: no usable eUICC *this boot* (on a
+      # comma-eSIM device the prime is retried at the next boot since dest stays absent).
+      # The only thing downstream is the convenience nmconnection for a comma eSIM profile,
+      # so "don't prime" is the right outcome for all of them. Unhandled, the exception escaped
+      # configure_modem() before hardwared set modem_configured, so the whole AT sequence
+      # re-ran on the next tick ("this modem gets upset with too many AT commands").
+      # Imported here, not at module level: common.swaglog -> system.hardware.hw ->
+      # system.hardware -> this module is a cycle in both directions.
+      from openpilot.common.swaglog import cloudlog
+      cloudlog.warning(f"eSIM prime skipped: LPA/ISD-R channel unavailable (physical SIM, or a transient modem/serial fault on an eUICC device): {e!r}")
+      prime = False
+    if prime and not os.path.exists(dest):
       with open(Path(__file__).parent/'esim.nmconnection') as f, tempfile.NamedTemporaryFile(mode='w') as tf:
         dat = f.read()
         dat = dat.replace("sim-id=", f"sim-id={sim_id}")
