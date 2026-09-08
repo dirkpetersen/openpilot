@@ -606,6 +606,19 @@ struct PandaState @0xa7649e2575e4591e {
   # madsheartbeat2pnw: the DisengageReason that last took lateral authority down
   # (opendbc/safety/pnw/mads_declarations.h). Diagnostic only; 0 = none.
   madsDisengageReason @39 :UInt8;
+  # madsheartbeat2pnw: pandad's health read for this panda returned a DIFFERENT number of bytes
+  # than this build's health_t, i.e. the flashed firmware has another health_t layout. The only
+  # such panda in this fleet is the Tesla Raven's second (black F4) panda, flashed from the frozen
+  # prebuilt selfdrive/pandad/fw/panda_f4.bin.signed (DEV-fd39c10f): its health_t is 58 bytes and
+  # is NOT a prefix of ours -- it inserts fan_stall_count at byte 52. Bytes 0-51 are layout-
+  # identical to ours (controlsAllowed, safetyModel, safetyParam, heartbeatLost, alternative-
+  # Experience, faults, safetyRxChecksInvalid), so those are trustworthy; EVERYTHING FROM BYTE 52
+  # ON (sbu1Voltage, sbu2Voltage, soundOutputLevel, controlsAllowedLateral, madsDisengageReason)
+  # is unreliable on a mismatched panda -- treat it as UNKNOWN, not as false/zero.
+  # Set once, definitive (a comms error never sets it -- see selfdrive/pandad/panda.cc get_state).
+  # Fork fields normally go in custom.capnp, but PandaState lives here and @38/@39 above set the
+  # precedent for extending it in place.
+  healthPacketMismatch @40 :Bool;
 
   # can health
   canState0 @29 :PandaCanState;

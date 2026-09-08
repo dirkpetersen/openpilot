@@ -651,10 +651,24 @@ class SelfdriveD:
     # `lateral_only`: both are one frame stale here (data_sample runs before mads.update, exactly
     # as it does before the state machine above), and without it a re-engage could carry a
     # saturated counter into an enabled frame and immediate-disable a car that is steering fine.
+    #
+    # A panda whose health_t LAYOUT is not this build's (healthPacketMismatch) is skipped here, and
+    # ONLY here. The Tesla Raven's second (black F4) panda runs the frozen prebuilt DEV-fd39c10f:
+    # its health_t is 58 bytes and inserts fan_stall_count at byte 52, where ours (panda/board/
+    # health.h @ c5e431e1, 61 bytes) has none. The two layouts are identical through byte 51, so
+    # byte 34 controls_allowed_pkt (and safety_mode/param, heartbeat_lost, alt_experience) is
+    # trustworthy and the longitudinal check above is deliberately NOT gated. From byte 52 on the
+    # parse is misaligned (sbu voltages, sound level) or never written: byte 59
+    # controls_allowed_lateral_pkt and byte 60 mads_disengage_reason_pkt read 0 forever. Both
+    # Raven pandas carry teslaLegacy, so IGNORED_SAFETY_MODES does not cover it, and without this
+    # exclusion the counter climbs every frame from a value nobody measured and fires
+    # madsControlsMismatchLateral 2 s into every lateral-only state on that car. "Unknown" is
+    # neither True nor False: we do not substitute controlsAllowed for it, and a panda that DOES
+    # report the field is still held to it.
     if self.enabled or not (self.mads.available and self.mads.lateral_only):
       self.lateral_mismatch_counter = 0
     elif any(not ps.controlsAllowedLateral for ps in self.sm['pandaStates']
-             if ps.safetyModel not in IGNORED_SAFETY_MODES):
+             if ps.safetyModel not in IGNORED_SAFETY_MODES and not ps.healthPacketMismatch):
       self.lateral_mismatch_counter += 1
 
     return CS

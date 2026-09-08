@@ -117,23 +117,28 @@ std::optional<health_t> Panda::get_state() {
   // panda is flashed separately from this code, so "new openpilot, old panda" WILL happen. Both
   // transports return the number of bytes the panda actually sent (libusb_control_transfer; the
   // SPI response header's rx_data_len), and the firmware always answers 0xd2 with sizeof(health_t)
-  // of ITS build. A short read therefore means the flashed firmware predates a field added here,
-  // and `health` keeps the zero-initialised tail -- a FABRICATED value for the new fields.
+  // of ITS build. A size mismatch therefore means the flashed firmware has ANOTHER health_t layout,
+  // and `health` is a mis-parse of it: fields the layouts share (a common prefix) are right, and
+  // everything after the first divergence is misaligned garbage or the zero-initialised tail.
   //
   // Flagged, logged once, and still returned -- the refusal is made in connect(), and ONLY for a
   // panda this openpilot actually flashes. It must not be made here: the Tesla Raven runs a SECOND,
-  // DEPRECATED panda that pandad.py flashes from a checked-in prebuilt binary (F4), or skips
-  // entirely, so that panda can legitimately run an older health_t forever. Returning nullopt for
-  // it would stop pandaStates and the heartbeat for the WHOLE car -- taking the Raven off the road
-  // over a field only the car's own panda is ever read for. The zeroed tail is the fail-safe value
-  // in both cases ("lateral not permitted", "no disengage reason"), and that panda sits in
-  // SILENT/NO_OUTPUT, which selfdrived's IGNORED_SAFETY_MODES already excludes.
-  // (Fable review 2026-09-05 -- the earlier version returned nullopt here and would have
-  // crash-looped pandad on the Raven.)
+  // DEPRECATED black F4 panda that pandad.py flashes from a checked-in prebuilt
+  // (selfdrive/pandad/fw/panda_f4.bin.signed, DEV-fd39c10f) or skips entirely, so that panda runs
+  // an older health_t forever: 58 bytes, layout-identical to ours through byte 51, then
+  // fan_stall_count inserted at byte 52. Returning nullopt for it would stop pandaStates and the
+  // heartbeat for the WHOLE car -- taking the Raven off the road. Both Raven pandas carry
+  // teslaLegacy (NOT a silent mode), so its zeroed controls_allowed_lateral_pkt would read as a
+  // permanent lateral revoke; pandad publishes PandaState.healthPacketMismatch so selfdrived can
+  // treat that field (and everything else from byte 52 on) as UNKNOWN rather than false.
+  // (Fable review 2026-09-05 -- an earlier version returned nullopt here and would have
+  // crash-looped pandad on the Raven. Fable review 2026-09-07 -- the F4 layout is a divergence at
+  // byte 52, not a truncation; the prefix-identity is what makes controls_allowed trustworthy.)
   if (err != (int)sizeof(health)) {
     if (!health_packet_mismatch.exchange(true)) {
       LOGE("panda %s health packet size mismatch: panda sent %d bytes, this build expects %d. "
-           "Fields past byte %d are NOT from this panda.", hw_serial().c_str(), err, (int)sizeof(health), err);
+           "Its health_t layout differs from this build's; only fields in the shared prefix are valid.",
+           hw_serial().c_str(), err, (int)sizeof(health));
     }
   }
   return std::make_optional(health);

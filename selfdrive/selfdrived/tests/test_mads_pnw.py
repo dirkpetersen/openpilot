@@ -520,10 +520,12 @@ class TestNeverSuppresses:
 # ---------------------------------------------------------------------------------------------
 
 class _FakePandaState:
-  def __init__(self, controls_allowed_lateral: bool, safety_model=car.CarParams.SafetyModel.ford):
+  def __init__(self, controls_allowed_lateral: bool, safety_model=car.CarParams.SafetyModel.ford,
+               health_packet_mismatch: bool = False):
     self.controlsAllowedLateral = controls_allowed_lateral
     self.controlsAllowed = controls_allowed_lateral
     self.safetyModel = safety_model
+    self.healthPacketMismatch = health_packet_mismatch
 
 
 class _FakeSM:
@@ -637,6 +639,91 @@ class TestLateralMismatchDetector:
       sd.data_sample()
     assert sd.mismatch_counter == 0, "MADS must never be able to move the longitudinal counter"
 
+  # ---- healthPacketMismatch: an UNREAD field is unknown, not false ---------------------------
+  # The Tesla Raven's second (black, F4) panda runs the frozen prebuilt DEV-fd39c10f and answers
+  # 0xd2 with a 58-byte health_t that is layout-identical to ours (61 bytes, panda/board/health.h
+  # @ c5e431e1) only through byte 51: byte 34 controls_allowed_pkt is trustworthy, byte 59
+  # controls_allowed_lateral_pkt is never written and reads 0 forever. Both Raven pandas are
+  # teslaLegacy (NOT in IGNORED_SAFETY_MODES), so without the exclusion the counter would climb
+  # every frame from a value nobody measured.
+
+  def test_mismatched_panda_reporting_false_is_not_read_as_a_revoke(self):
+    torn = _FakePandaState(False, health_packet_mismatch=True)
+    sd = _sd_for_mismatch(available=True, lateral_only=True, enabled=False, panda_states=[torn])
+    for _ in range(250):   # past the 200-frame firing threshold
+      sd.data_sample()
+    assert sd.lateral_mismatch_counter == 0
+
+  def test_healthy_panda_reporting_false_still_counts(self):
+    """The exclusion must not gut the check: a panda whose health packet was complete and which
+    says lateral is NOT allowed is a genuine revoke."""
+    healthy = _FakePandaState(False, health_packet_mismatch=False)
+    sd = _sd_for_mismatch(available=True, lateral_only=True, enabled=False, panda_states=[healthy])
+    for expected in range(1, 6):
+      sd.data_sample()
+      assert sd.lateral_mismatch_counter == expected
+
+  def test_two_pandas_healthy_true_plus_mismatched_false_does_not_count(self):
+    """The Raven shape: the car's own panda reports truthfully and permits lateral; the frozen
+    second panda cannot report the field at all."""
+    states = [_FakePandaState(True), _FakePandaState(False, health_packet_mismatch=True)]
+    sd = _sd_for_mismatch(available=True, lateral_only=True, enabled=False, panda_states=states)
+    for _ in range(250):
+      sd.data_sample()
+    assert sd.lateral_mismatch_counter == 0
+
+  def test_two_pandas_healthy_false_plus_mismatched_true_still_counts(self):
+    """And the other way round: the mismatched panda's (unread) value must not MASK a genuine
+    revoke from the healthy one either -- skipping is not the same as vouching."""
+    states = [_FakePandaState(False), _FakePandaState(True, health_packet_mismatch=True)]
+    sd = _sd_for_mismatch(available=True, lateral_only=True, enabled=False, panda_states=states)
+    for expected in range(1, 6):
+      sd.data_sample()
+      assert sd.lateral_mismatch_counter == expected
+
+  def test_mismatch_flag_does_not_gate_the_longitudinal_check(self):
+    """controls_allowed_pkt (byte 34) IS inside the short read and stays trusted: a mismatched
+    panda reporting controlsAllowed=False while openpilot is enabled must still climb the
+    ORIGINAL counter. The exclusion is lateral-only."""
+    torn = _FakePandaState(False, health_packet_mismatch=True)   # controlsAllowed=False too
+    sd = _sd_for_mismatch(available=True, lateral_only=False, enabled=True, panda_states=[torn])
+    for expected in range(1, 6):
+      sd.data_sample()
+      assert sd.mismatch_counter == expected
+    assert sd.lateral_mismatch_counter == 0
+
+  def test_exclusion_works_on_a_real_pandastates_reader(self):
+    """The fakes above use attribute names by hand; this drives data_sample with a REAL
+    cereal PandaState reader so a typo in the capnp field name cannot pass the fakes."""
+    def reader(*, lateral: bool, mismatch: bool):
+      msg = log.Event.new_message()
+      pss = msg.init('pandaStates', 2)
+      for i, (lat, mm) in enumerate([(True, False), (lateral, mismatch)]):
+        pss[i].safetyModel = car.CarParams.SafetyModel.teslaLegacy
+        pss[i].controlsAllowed = True
+        pss[i].controlsAllowedLateral = lat
+        pss[i].healthPacketMismatch = mm
+      return msg.as_reader().pandaStates
+
+    sd = _sd_for_mismatch(available=True, lateral_only=True, enabled=False,
+                          panda_states=reader(lateral=False, mismatch=True))
+    for _ in range(250):
+      sd.data_sample()
+    assert sd.lateral_mismatch_counter == 0, "short-read panda must be skipped"
+
+    sd = _sd_for_mismatch(available=True, lateral_only=True, enabled=False,
+                          panda_states=reader(lateral=False, mismatch=False))
+    for _ in range(5):
+      sd.data_sample()
+    assert sd.lateral_mismatch_counter == 5, "complete-read panda must still be held to it"
+
+  def test_health_packet_mismatch_has_the_next_free_ordinal(self):
+    fields = {f.name: f for f in log.PandaState.schema.node.struct.fields}
+    assert 'healthPacketMismatch' in fields
+    assert fields['healthPacketMismatch'].ordinal.explicit == 40
+    assert fields['controlsAllowedLateral'].ordinal.explicit == 38
+    assert fields['madsDisengageReason'].ordinal.explicit == 39
+
   # ---- the event ---------------------------------------------------------------------------
 
   def test_event_is_raised_at_two_seconds(self):
@@ -705,6 +792,15 @@ class TestPandadHeartbeatPlumbing:
   def test_pandad_publishes_the_pandas_lateral_authority(self):
     src = (self.PANDAD / "pandad.cc").read_text()
     assert "ps.setControlsAllowedLateral((bool)(health.controls_allowed_lateral_pkt));" in src
+
+  def test_pandad_publishes_the_short_read_flag_from_the_panda_object(self):
+    """healthPacketMismatch must come from Panda::health_packet_mismatch (set-once by the short
+    read in get_state), never from the health struct itself (whose tail is exactly what is
+    untrustworthy), and never by substituting controls_allowed_pkt into the lateral field."""
+    src = (self.PANDAD / "pandad.cc").read_text()
+    assert "fill_panda_state(ps, panda->hw_type, health, panda->health_packet_mismatch);" in src
+    assert "ps.setHealthPacketMismatch(health_packet_mismatch);" in src
+    assert "setControlsAllowedLateral((bool)(health.controls_allowed_pkt" not in src
 
   def test_health_packet_short_read_is_flagged_not_zero_filled_silently(self):
     """The versioned-wire-struct guard: an old panda answers 0xd2 with fewer bytes than this build

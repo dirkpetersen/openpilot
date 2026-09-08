@@ -155,7 +155,8 @@ void can_recv(std::vector<Panda *> &pandas, PubMaster *pm) {
   }
 }
 
-void fill_panda_state(cereal::PandaState::Builder &ps, cereal::PandaState::PandaType hw_type, const health_t &health) {
+void fill_panda_state(cereal::PandaState::Builder &ps, cereal::PandaState::PandaType hw_type, const health_t &health,
+                      bool health_packet_mismatch) {
   ps.setVoltage(health.voltage_pkt);
   ps.setCurrent(health.current_pkt);
   ps.setUptime(health.uptime_pkt);
@@ -187,6 +188,16 @@ void fill_panda_state(cereal::PandaState::Builder &ps, cereal::PandaState::Panda
   // madsheartbeat2pnw: WHY the panda last took lateral down (opendbc DisengageReason).
   // Diagnostic only -- nothing reads it for control.
   ps.setMadsDisengageReason(health.mads_disengage_reason_pkt);
+  // madsheartbeat2pnw: tells the consumer that this panda's health_t layout is NOT this build's.
+  // The Raven's F4 panda (frozen prebuilt DEV-fd39c10f, 58 bytes) inserts fan_stall_count at byte
+  // 52, so bytes 0-51 above are trustworthy and everything from byte 52 on -- sbu1/sbu2 voltage,
+  // soundOutputLevel, and the two MADS fields -- is misaligned or never written. Published as-is
+  // rather than substituted from controls_allowed_pkt: a value we did not read must stay "unknown",
+  // never be laundered into a real-looking one. The consumer (selfdrived's lateral mismatch
+  // counter) skips such a panda for the LATERAL check only; controlsAllowed (byte 34) stays trusted
+  // BECAUSE the two layouts agree through byte 51 (compare board/health.h at fd39c10f vs the pin),
+  // not merely because it is inside the read. Re-verify that prefix after ANY health.h change.
+  ps.setHealthPacketMismatch(health_packet_mismatch);
 }
 
 void fill_panda_can_state(cereal::PandaState::PandaCanState::Builder &cs, const can_health_t &can_health) {
@@ -295,7 +306,7 @@ std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> 
     }
 
     auto ps = pss[i];
-    fill_panda_state(ps, panda->hw_type, health);
+    fill_panda_state(ps, panda->hw_type, health, panda->health_packet_mismatch);
 
     auto cs = std::array{ps.initCanState0(), ps.initCanState1(), ps.initCanState2()};
     for (uint32_t j = 0; j < PANDA_CAN_CNT; j++) {
