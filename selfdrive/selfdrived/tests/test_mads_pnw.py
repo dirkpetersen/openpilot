@@ -421,12 +421,18 @@ class TestNeverSuppresses:
 
   def test_mads_update_is_called_with_exactly_the_right_arguments_in_order(self):
     """Parsed, not grepped: swapping the first two arguments (enabled/active) or dropping
-    regenBraking would be invisible to a substring check."""
+    regenBraking would be invisible to a substring check.
+
+    The last two were added by onebutton2pnw: `cruise_available` is the ACC master (MADS drops
+    everything when the car withdraws it) and `off_requested` is the driver's explicit
+    cruise-button OFF. Extending this list is the intended cost of adding an argument -- the
+    whole point is that the order cannot drift silently. (It did: the two were added without
+    updating this test, which then failed on an untouched baseline until 2026-09-07.)"""
     call = _find_call(SelfdriveD.step, "mads", "update")
     assert call is not None, "selfdrived must call self.mads.update()"
     assert [ast.unparse(a) for a in call.args] == [
       "self.enabled", "self.active", "CS.brakePressed or CS.regenBraking",
-      "CS.cruiseState.enabled", "self.events"]
+      "CS.cruiseState.enabled", "self.events", "CS.cruiseState.available", "off_req"]
 
   def test_warning_alerts_are_readmitted_while_mads_steers_alone(self):
     """Without this, openpilot's own state machine sits in `disabled` (current_alert_types ==
