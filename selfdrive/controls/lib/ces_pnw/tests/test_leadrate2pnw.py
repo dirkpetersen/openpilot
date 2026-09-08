@@ -163,6 +163,10 @@ class _SteerLogHarness:
     self._sl_lat_dem = self._sl_lat_max = self._sl_curv_max = 0.0
     self._sl_sat = self._sl_lat_active = self._sl_ang_sat = False
     self._sl_k_cmd = self._sl_k_actl = self._sl_k_err = 0.02
+    # coopsteer-shadow2pnw: the cp* shadow-nudge fields the breadcrumb now carries (None == not
+    # published / no capability; the real class seeds these in __init__).
+    self._cp_off = self._cp_tgt = self._cp_cap = self._cp_why = None
+    self._cp_tq = self._cp_rate = self._cp_cmd = None
     self.captured: list = []
     self.read_map_calls = 0
 

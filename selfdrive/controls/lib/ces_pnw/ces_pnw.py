@@ -1838,6 +1838,15 @@ class CESController:
     self._sl_k_cmd = None        # commanded curvature this tick (-self.desired_curvature)
     self._sl_k_actl = None       # achieved/measured curvature, derived from CS.yawRate / vEgo
     self._sl_k_err = None        # kCmd - kActl -- sustained large + hands-off = real saturation
+    # coopsteer-shadow2pnw: the SHADOW torque-nudge fragment (cp*) riding in the same SteerLimitStatus
+    # dict. None == not published / no capability (Ford); on the Raven cpWhy is always a reason string.
+    self._cp_off = None          # deg the nudge WOULD have added (never applied this round)
+    self._cp_tgt = None          # raw pre-washout target (deg)
+    self._cp_cap = None          # magnitude bound in force (deg)
+    self._cp_why = None          # reason code (coopsteer_pnw.REASON_*) or "error"
+    self._cp_tq = None           # CS.steeringTorque (Nm) -- THE sign-question input
+    self._cp_rate = None         # CS.steeringRateDeg -- THE sign-question response
+    self._cp_cmd = None          # angle the wire WOULD have carried (cmd + offset)
     # steertele2pnw: capability-analysis additions — see the steer_limit_status comment block in
     # controlsd.py for the full derivation of each. Same defaulting rationale as the sl* fields above.
     self._sl_lat_active = False  # CC.latActive this tick -- False means angDes/angAct froze to manual steering, not an openpilot capability signal
@@ -2209,12 +2218,31 @@ class CESController:
       # separate publish/read cycle.
       self._sl_lat_active = bool(sl.get("latActive", False))
       self._sl_ang_sat = bool(sl.get("angSat", False))
+      # coopsteer-shadow2pnw: same dict, same defensive pattern. A missing key reads None -- and on
+      # the Raven a None cpWhy therefore means "controlsd never published the fragment", which is
+      # exactly the silent-evaporation failure this cherry-pick exists to make visible.
+      cp_off = sl.get("cpOff")
+      self._cp_off = round(float(cp_off), 3) if cp_off is not None else None
+      cp_tgt = sl.get("cpTgt")
+      self._cp_tgt = round(float(cp_tgt), 3) if cp_tgt is not None else None
+      cp_cap = sl.get("cpCap")
+      self._cp_cap = round(float(cp_cap), 2) if cp_cap is not None else None
+      cp_why = sl.get("cpWhy")
+      self._cp_why = str(cp_why) if cp_why is not None else None
+      cp_tq = sl.get("cpTq")
+      self._cp_tq = round(float(cp_tq), 3) if cp_tq is not None else None
+      cp_rate = sl.get("cpRate")
+      self._cp_rate = round(float(cp_rate), 2) if cp_rate is not None else None
+      cp_cmd = sl.get("cpCmd")
+      self._cp_cmd = round(float(cp_cmd), 3) if cp_cmd is not None else None
     except Exception:
       self._sl_curv_lim = self._sl_safe_lim = self._sl_sat = False
       self._sl_ang_des = self._sl_ang_act = self._sl_ang_err = None
       self._sl_lat_dem = self._sl_lat_max = self._sl_curv_max = None
       self._sl_k_cmd = self._sl_k_actl = self._sl_k_err = None
       self._sl_lat_active = self._sl_ang_sat = False
+      self._cp_off = self._cp_tgt = self._cp_cap = self._cp_why = None
+      self._cp_tq = self._cp_rate = self._cp_cmd = None
     # steerpower2pnw I3 review fix: append this refresh's (wall_time, bearing, gps_valid) sample to
     # the bounded history — see _nearest_bearing()/_BEARING_HIST_MAXLEN above. gps_valid mirrors the
     # exact "gps" test every record already uses (lat AND lon present); a no-fix sample is still
@@ -2493,6 +2521,10 @@ class CESController:
         "slLatDem": self._sl_lat_dem, "slLatMax": self._sl_lat_max, "slCurvMax": self._sl_curv_max,
         "slSat": self._sl_sat, "slLatAct": self._sl_lat_active, "slAngSat": self._sl_ang_sat,
         "slKCmd": self._sl_k_cmd, "slKActl": self._sl_k_actl, "slKErr": self._sl_k_err,
+        # coopsteer-shadow2pnw: SHADOW torque-nudge fields (from SteerLimitStatus). Sign question:
+        # sign(cpTq) vs sign(cpRate)/d(slAngAct) at light torque; cpOff is what we WOULD have added.
+        "cpOff": self._cp_off, "cpTgt": self._cp_tgt, "cpCap": self._cp_cap, "cpWhy": self._cp_why,
+        "cpTq": self._cp_tq, "cpRate": self._cp_rate, "cpCmd": self._cp_cmd,
         # steerpower2pnw: LOGGING ONLY — delivered lateral accel (m/s^2, signed) + 8-pt compass
         # heading, to measure the truck's true hands-off steering capability by direction. I4 review
         # fix: heading nulls (not "N") when there's no current GPS fix, rather than _compass()
@@ -3118,6 +3150,10 @@ class CESController:
       # the empirical saturation signal to characterize this truck's real curvature limit. Display/log
       # only, same as sl* above. See docs/STEERING-LIMITS.md "Ford curvature interface" section.
       "slKCmd": self._sl_k_cmd, "slKActl": self._sl_k_actl, "slKErr": self._sl_k_err,
+      # coopsteer-shadow2pnw: SHADOW torque-nudge fields (from SteerLimitStatus) -- same fragment the
+      # CES-off "steer" breadcrumb carries, so the sign question can be settled on any drive.
+      "cpOff": self._cp_off, "cpTgt": self._cp_tgt, "cpCap": self._cp_cap, "cpWhy": self._cp_why,
+      "cpTq": self._cp_tq, "cpRate": self._cp_rate, "cpCmd": self._cp_cmd,
       # steerpower2pnw: LOGGING ONLY — delivered lateral accel (m/s^2, signed) + 8-pt compass heading,
       # to measure the truck's true hands-off steering capability by direction (see module docstring
       # near _ach_lat/_compass).

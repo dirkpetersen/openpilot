@@ -327,6 +327,16 @@ class PnwVehicle:
     # nudgeless (blinker-hold) lane change support — BSM-gated in DesireHelper
     self.nudgeless: bool = brand == "tesla" or fp == "FORD_F_150_LIGHTNING_MK1"
 
+    # coopsteer-shadow2pnw: Penduras "cooperative steering" sub-threshold torque nudge
+    # (selfdrive/controls/lib/coopsteer_pnw.py), SHADOW-LOGGED ONLY this round -- controlsd computes
+    # and publishes what it WOULD do; nothing reaches the actuators. Gated to the exact car the sign
+    # convention will be road-confirmed on (TESLA-MADS-FEASIBILITY.md s3: it is inferred, never
+    # confirmed, on our Raven or on Penduras'); extending to another Tesla class needs its own
+    # confirmation. LOAD-BEARING, not tidiness: the Ford also runs LatControlAngle, so without this
+    # gate the shadow would run there too and pollute the Lightning's cp* telemetry (actuation-inert
+    # either way -- the Ford carcontroller consumes actuators.curvature, never steeringAngleDeg).
+    self.coop_steer: bool = fp == "TESLA_MODEL_S_HW3"
+
     # curveslow-lightning: the Lightning's EPS is physically weaker than the Tesla's and washes out of
     # curves the Tesla holds, so it must enter curves SLOWER. This is a steering-authority FACT, not a
     # config choice, so it applies in BOTH op-long (VTSC) and stock-ACC (ICBM) — both produce a curve
