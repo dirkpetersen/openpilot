@@ -112,7 +112,13 @@ class LocationServicesStatusRenderer(Widget):
       txt = f"Police   {self._dist_text(p.get('dist_mi'))}"
       # driver req 2026-07-09: age since the last Waze report/confirmation, so a long-lived icon
       # (we now match the Waze app's display lifetime) can be judged for staleness at a glance.
-      a = p.get("age_min")
+      # policelastseen2pnw (2026-09-08): that is what this line always MEANT, but `age_min` is the
+      # report's Waze publication age -- "Police 1.5 mi (65 min)" read as "first reported 65 min ago",
+      # not "last confirmed 65 min ago" (driver). Prefer `last_seen_min`, which is minutes since our
+      # last feed evidence. `age_min` remains the fallback so an older locationd payload still renders.
+      a = p.get("last_seen_min")
+      if a is None:
+        a = p.get("age_min")
       if a is not None:
         txt += f" ({int(a)} min)"
       d = p.get("dir")

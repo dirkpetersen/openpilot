@@ -117,6 +117,7 @@ EV_TRACK_MI = 8.0                          # only recede-track chargers within t
 # (the gatherer scoped rest areas within ~2 km of the mainline, so 1.5 mi comfortably keeps the real ones).
 REST_MAX_PERP_M = 1.5 * geo.M_PER_MILE
 DISPLAY_MAX_DIST_M = 15.0 * geo.M_PER_MILE   # all three (police/EV/rest) show a POI starting ~15 mi ahead (driver request)
+DISPLAY_MAX_MI = DISPLAY_MAX_DIST_M / geo.M_PER_MILE   # same bound in miles, for straight-line (live_mi) comparisons
 POLICE_POLL_S = 60.0                       # ≤ 1/min (decision §7 / POLICE_WARNING_DESIGN §7)
 POLICE_BBOX_DEG = 0.30                     # axis-aligned box (~±20 mi) around current GPS
 # POLICE freshness (driver decision 2026-07-09, supersedes the 20-min fresher-only rule of 2026-07-01):
@@ -833,7 +834,11 @@ def merge_retained_police(cache, alerts, now, retain_s=POLICE_RETAIN_S, cap=POLI
     fresh_al.pop("retained", None)
     new_cache[u] = {"al": fresh_al, "seen": now}
 
-  out = list(alerts)
+  # policelastseen2pnw (2026-09-08, driver): stamp WHEN we last had feed evidence for each report, so
+  # the UI can say "last seen N min ago" instead of "first reported N min ago". A live alert's evidence
+  # is this poll (`now`); a retained one's is the last poll that carried it (`ent["seen"]`). Shallow
+  # copies are safe here: _PoliceRecede._key() keys on uuid (or quantized lat/lon), never on identity.
+  out = [dict(al, last_seen=now) for al in alerts]
   for u, ent in list(new_cache.items()):
     if u in live_ids:
       continue
@@ -842,6 +847,7 @@ def merge_retained_police(cache, alerts, now, retain_s=POLICE_RETAIN_S, cap=POLI
       continue
     held = dict(ent["al"])
     held["retained"] = True
+    held["last_seen"] = ent.get("seen")
     out.append(held)
 
   if len(new_cache) > cap:                       # bound the cache: drop least-recently-seen first
@@ -1053,6 +1059,16 @@ def _line_police(alerts, state, err, lat, lon, brg, path, recede):
     try:
       dbg.append({"lat": round(float(al.get("lat", 0)), 5), "lon": round(float(al.get("lon", 0)), 5),
                   "mi": recede.live_mi(al, lat, lon), "age_min": age, "v": verdict,
+                  # policenear2-2pnw forensics: the 2026-09-08 root-cause needed the relative bearing
+                  # of every report and it had to be recomputed offline from lat/lon/brg. Log it, so
+                  # "was the pick even ahead of us?" is answerable from the file alone. Also
+                  # `last_seen` age, so feed LATENCY (the larger miss mechanism: median 15 min old at
+                  # first sighting) is measurable without diffing consecutive records.
+                  "rel": (None if brg is None else
+                          round(abs(geo.normalize180(geo.bearing_deg(lat, lon, float(al["lat"]),
+                                                                     float(al["lon"])) - brg)), 1)),
+                  "seen_min": (None if al.get("last_seen") is None
+                               else round((now - float(al["last_seen"])) / 60.0, 1)),
                   "thumbs": al.get("thumbs"), "tier": _tier_of(al, now, base, bonus), "retained": bool(al.get("retained")),
                   # policedbguuid2pnw: log the FULL uuid. Waze ids look like
                   # "alert-34594548/83073a43-e136-4dc7-...", so the old [:8] slice collapsed every
@@ -1066,15 +1082,42 @@ def _line_police(alerts, state, err, lat, lon, brg, path, recede):
       pass
     if verdict == "kept":
       fresh.append(al)
-  # policenear2pnw: a report inside POLICE_NEAR_MI outranks EVERYTHING further out, and the closest
-  # such report wins on straight-line distance. Deliberately bypasses the along-track projection: at
-  # this range it is the projection that is unstable, and it is the only thing that let a 6 mi report
-  # take the line away from a sighting the driver was actively approaching.
+  # policenear2-2pnw (2026-09-08): rank by straight-line distance over the WHOLE set, at EVERY range.
+  #
+  # This is what the comment below has always CLAIMED ("purely proximity-first over the whole set"),
+  # but it was only true inside POLICE_NEAR_MI; beyond 1 mi selection fell through to
+  # geo.nearest_ahead()'s along-track projection. Measured on the 2026-09-08 I-5 drive
+  # (drives/2026-09-08/i5-evening-police-miss-and-onramp-steer/, 77 forensics ticks):
+  #   - the displayed report was OUTSIDE a 60-deg forward cone in 30/77 ticks (39%; 42% time-weighted)
+  #   - a NEARER in-hemisphere report existed and lost in 28/77 ticks (36%)
+  #   - worst: 24.5 mi displayed while 4.1 mi was available
+  #
+  # WHY the projection is unusable here, and it is worse than "the path is short": `path` is the whole
+  # current OSM way from its FIRST NODE onward (mapd extended_state.go CurrentWay.Way.Nodes, bridged by
+  # mapd_configd.py), and geo.ahead()'s path branch measures `along` from path[0] -- NOT from the car.
+  # path[0] can be kilometres BEHIND us. So `along_m` is not a distance from the car at all: a report
+  # behind the car, or one that a bend (ahead or behind) projects onto the polyline interior, scores a
+  # tiny `along` and wins. 8 of those 30 bad picks were at -127 to -157 deg, i.e. squarely BEHIND.
+  #
+  # WHY NOT bound the perpendicular offset instead (the obvious fix, and my first one): simulated at
+  # 1.5 mi it returns NOTHING in 13/77 ticks that had a legitimate 3-6 mi report, and it cannot
+  # separate the cases -- bad picks have perp ~= d, but a legitimate report 4 mi ahead at 50 deg on a
+  # curving road has perp ~= 0.77d. No threshold exists. Under the driver's rule (2026-09-08: "if
+  # there's a police report too many that's fine, I just don't want to miss any") a remedy that
+  # manufactures false negatives is the wrong direction, so the projection is DELETED rather than bounded.
+  #
+  # Forward HEMISPHERE (POLICE_NEAR_CONE_DEG = 90), not the old 60-deg cone: 60 deg hid the closest
+  # report in 20+ ticks where it sat at 61-88 deg. Reports behind us have no display value and
+  # recede-tracking already retires them. brg unknown -> no bearing filter at all (fail OPEN: never
+  # drop a report because we do not know our own heading).
+  #
+  # NOTE this deliberately does NOT touch geo.nearest_ahead itself -- the EV/rest-area POI picker
+  # (~:1248) still uses it and is out of scope.
   def _select(cands):
-    near = []
+    ranked = []
     for al in cands:
       d = recede.live_mi(al, lat, lon)
-      if d is None or d > POLICE_NEAR_MI:
+      if d is None or d > DISPLAY_MAX_MI:
         continue
       if brg is not None:
         try:
@@ -1083,10 +1126,11 @@ def _line_police(alerts, state, err, lat, lon, brg, path, recede):
           continue
         if rel > POLICE_NEAR_CONE_DEG:
           continue                                # behind us — leave it to recede-tracking to retire
-      near.append((d, al))
-    if near:
-      return min(near, key=lambda t: t[0])[1], None
-    return geo.nearest_ahead(path, lat, lon, brg, cands, max_fallback_m=DISPLAY_MAX_DIST_M)
+      ranked.append((d, al))
+    if not ranked:
+      return None, None
+    # tie-break on uuid so equal distances cannot flap tick-to-tick (and so the key never compares dicts)
+    return min(ranked, key=lambda t: (t[0], (t[1].get("uuid") or "")))[1], None
 
   # policetier2pnw -- DISPLAY and CONTROL are separate channels (two Gemini review rounds).
   #
@@ -1120,6 +1164,15 @@ def _line_police(alerts, state, err, lat, lon, brg, path, recede):
          # (never dropped), but display-only. This tier describes the DISPLAYED report; what may act
          # on the car is the separate `cap` channel below.
          "tier": _tier_of(poi, now, base, bonus),
+         # policelastseen2pnw (2026-09-08, driver: "it should be the number of minutes when the police
+         # was LAST seen"): minutes since our last feed EVIDENCE for this report, not since Waze first
+         # published it. `age_min` above is the report's own age (ts = Waze publication) and is what
+         # _tier_of grades on -- it is kept unchanged for the tier, the forensics log and back-compat.
+         # A live report resolves to the age of the poll that carried it (~0-4 min: 60 s poll + 180 s
+         # proxy TTL); a retained one to when it dropped out of the feed. Missing `last_seen` (an alert
+         # that never went through merge_retained_police) -> None, and the UI falls back to `age_min`.
+         "last_seen_min": (None if poi.get("last_seen") is None
+                           else max(0, int((now - float(poi["last_seen"])) // 60))),
          # policeretain2pnw: TRUE when this report has left the aggregator feed and we are only
          # showing it because we saw it earlier. The driver cannot otherwise tell a retained amber
          # from a merely-aged amber, and soundd uses this to NOT chirp the siren for one (a phantom
