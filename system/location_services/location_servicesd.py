@@ -194,8 +194,23 @@ _POLICE_TIER_MIN_BASE_MIN = 1.0        # ...nor everything UNCONFIRMED: base_min
 _POLICE_TIER_MAX_THUMBS = 20           # bound a garbage/huge upvote count before it scales BONUS
 _POLICE_TIER_RELOAD_S = 10.0
 _POLICE_TIER_MAX_B = 64 * 1024
-POLICE_NEAR_CONE_DEG = 90.0   # ...still only forward-hemisphere: near-locking must not resurrect a
+POLICE_NEAR_CONE_DEG = 90.0   # ...still only forward-hemisphere: selection must not resurrect a
                               # report we are driving AWAY from before recede-tracking retires it.
+# policenear2-2pnw (Fable review 2026-09-08): hysteresis on that hemisphere, for the report ALREADY
+# being shown. A hard 90-deg edge makes a report sitting abeam toggle in and out every couple of
+# seconds. MEASURED by replaying the new rule at 1 Hz against this drive's GPS (the police forensics
+# log is change-triggered on `chosen`, so it structurally CANNOT show flicker of a rule that was not
+# running -- my own replay could not have caught this):
+#     strict 90 deg      : 37 pick changes, 11 flip-backs within 30 s, 9 displays under 5 s, median 20 s
+#     with this 15-deg hold: 16 pick changes,  0 flip-backs,            0 short displays,   median 137 s
+# Worst case seen: report 9caec1d4 (5.4 mi, rel 86-89.5 deg) toggling against a3dde329 (7.2 mi, 74 deg)
+# every 2-3 s -- "Police 5.4 mi" / "Police 7.2 mi" four to five times in ten seconds.
+# recede-tracking does NOT bound this, which is where I was wrong: it retires reports you drive PAST,
+# and a report abeam on a parallel road never satisfies "receded past closest approach" while the road
+# runs alongside it (9caec1d4 stayed `kept` for the whole window and only retired 26 mi later).
+# Admission only -- RANKING is untouched, so a nearer report still wins immediately; this merely holds
+# the outgoing one. Replay confirms 0 empties and 0 ticks where it picks farther than the strict rule.
+POLICE_HOLD_CONE_EXTRA = 15.0   # the currently-shown report is admitted out to 90+15 = 105 deg
 
 
 def _now_epoch() -> float:
@@ -938,6 +953,11 @@ class _PoliceRecede:
     self.recede_mi = recede_mi
     self.min_d = {}       # key -> min straight-line miles seen while approaching
     self.passed = set()   # keys we've driven past -> suppressed (don't resurrect a report we passed)
+    # policenear2-2pnw: uuid last selected, PER CHANNEL ("display" / "cap"), for the hemisphere
+    # hysteresis in _line_police._select. Lives here because this object is the one piece of police
+    # state that already persists across ticks; the two channels must not share a slot or the cap
+    # pick would hold the display pick's report and vice versa.
+    self.last_pick = {}
 
   @staticmethod
   def _key(al):
@@ -993,6 +1013,31 @@ class _PoliceRecede:
     except (KeyError, TypeError, ValueError):
       return None
     return round(d, 1)
+
+
+_police_bad_coord_seen: set = set()
+
+
+def _police_bad_coord(al, chan):
+  """Rule 2: a report we cannot place is DROPPED, and a drop must never be silent.
+
+  Fable review 2026-09-08: malformed/NaN coordinates were skipped by a bare `except: continue`, and
+  the forensics entry for that report is ALSO lost (its own builder raises on the same float()), so a
+  proxy emitting bad rows was invisible in every channel at once -- while the driver's rule is
+  precisely that a report must never be missed. Logged ONCE per uuid per process: a broken upstream
+  row repeats on every 1 Hz tick, and an unthrottled warning would flood the log it needs to be
+  visible in."""
+  try:
+    key = (al.get("uuid") or "") + "|" + chan
+    if key in _police_bad_coord_seen:
+      return
+    _police_bad_coord_seen.add(key)
+    if len(_police_bad_coord_seen) > 500:       # bound it over a multi-drive daemon lifetime
+      _police_bad_coord_seen.clear()
+    cloudlog.warning("police: DROPPING an unplaceable report -- not shown, and absent from the forensics log too (chan=%s uuid=%s lat=%r lon=%r)",
+                     chan, al.get("uuid"), al.get("lat"), al.get("lon"))
+  except Exception:
+    cloudlog.exception("police: _police_bad_coord failed")
 
 
 _POLICE_DEBUG_PATH = "/data/pnw/location/police_debug.jsonl"
@@ -1113,7 +1158,10 @@ def _line_police(alerts, state, err, lat, lon, brg, path, recede):
   #
   # NOTE this deliberately does NOT touch geo.nearest_ahead itself -- the EV/rest-area POI picker
   # (~:1248) still uses it and is out of scope.
-  def _select(cands):
+  def _select(cands, chan):
+    # `chan` is "display" or "cap" -- the two channels keep SEPARATE hysteresis memory (see
+    # _PoliceRecede.last_pick). Sharing one slot would let the cap pick hold the display pick.
+    hold_uuid = recede.last_pick.get(chan)
     ranked = []
     for al in cands:
       # Rank on the UNROUNDED distance. recede.live_mi() rounds to 0.1 mi, which creates ties: two
@@ -1129,21 +1177,34 @@ def _line_police(alerts, state, err, lat, lon, brg, path, recede):
       try:
         d = geo.haversine_m(lat, lon, float(al["lat"]), float(al["lon"])) / geo.M_PER_MILE
       except (KeyError, TypeError, ValueError):
+        _police_bad_coord(al, chan)             # rule 2: a dropped report must not vanish silently
         continue
-      if not (d == d) or d > DISPLAY_MAX_MI:
+      if not (d == d):
+        _police_bad_coord(al, chan)
+        continue
+      if d > DISPLAY_MAX_MI:
         continue
       if brg is not None:
         try:
           rel = abs(geo.normalize180(geo.bearing_deg(lat, lon, float(al["lat"]), float(al["lon"])) - brg))
         except (KeyError, TypeError, ValueError):
           continue
-        if not (rel == rel) or rel > POLICE_NEAR_CONE_DEG:
+        # hysteresis: the report we are ALREADY showing is admitted 15 deg further out, so a report
+        # sitting abeam cannot toggle in and out every couple of seconds. Admission only -- the
+        # ranking below is unchanged, so any nearer report still takes the slot immediately.
+        limit = POLICE_NEAR_CONE_DEG
+        if hold_uuid is not None and al.get("uuid") == hold_uuid:
+          limit += POLICE_HOLD_CONE_EXTRA
+        if not (rel == rel) or rel > limit:
           continue                                # behind us (or unusable) — recede-tracking retires it
       ranked.append((d, al))
     if not ranked:
+      recede.last_pick.pop(chan, None)          # nothing to hold next tick
       return None, None
     # tie-break on uuid so exactly-equal distances cannot flap (and so the key never compares dicts)
-    return min(ranked, key=lambda t: (t[0], (t[1].get("uuid") or "")))[1], None
+    pick = min(ranked, key=lambda t: (t[0], (t[1].get("uuid") or "")))[1]
+    recede.last_pick[chan] = pick.get("uuid")
+    return pick, None
 
   # policetier2pnw -- DISPLAY and CONTROL are separate channels (two Gemini review rounds).
   #
@@ -1160,14 +1221,17 @@ def _line_police(alerts, state, err, lat, lon, brg, path, recede):
   # driver's "focus on the closest one" rule, and old reports still shown in amber), while the
   # CONTROL pick is published SEPARATELY as `cap` -- the nearest CONFIRMED report, which is the only
   # thing allowed to command a slowdown or raise the banner. Neither channel can suppress the other.
-  poi, _a = _select(fresh)
+  poi, _a = _select(fresh, "display")
   confirmed = [al for al in fresh if _tier_of(al, now, base, bonus) == "confirmed"]
-  cap_poi, _ca = _select(confirmed)
+  cap_poi, _ca = _select(confirmed, "cap")
   _police_debug_log(dbg, poi, lat, lon, brg)
   if poi is None:
     return {"state": "clear"}                     # nothing ahead
   live = recede.live_mi(poi, lat, lon)
-  # _a is None on the near-lock path (no along-track solve was needed); live_mi is guaranteed there.
+  # policenear2-2pnw: _select now ALWAYS returns (poi, None) -- there is no along-track solve left on
+  # the police path -- so `_a`/`_ca` are always None and these fallback_mi branches are dead. Kept as
+  # written rather than restructured: live_mi is guaranteed non-None here (selection ranked on it),
+  # and deleting the branch would touch the cap payload build for no behavioural gain.
   fallback_mi = round(_a["along_m"] / geo.M_PER_MILE, 1) if _a is not None else 0.0
   poi_age = _age_min(poi.get("ts"), now)
   out = {"state": "alert", "dist_mi": live if live is not None else fallback_mi,

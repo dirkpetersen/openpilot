@@ -165,7 +165,9 @@ class TestForensics:
     lsd._police_dbg_last["sig"] = None
     _line([_alert("a", 5.0), _alert("b", -3.0)])
     import json
-    recs = [json.loads(x) for x in open(tmp_path / "police_debug.jsonl") if x.strip()]
+    with open(tmp_path / "police_debug.jsonl") as f:      # NOT a bare open(): pyproject addopts
+      recs = [json.loads(x) for x in f if x.strip()]      # carries -Werror, so a leaked handle's
+                                                          # ResourceWarning FAILS the test (Fable)
     assert recs, "the forensics log must have been written"
     rels = [r.get("rel") for r in recs[-1]["reports"]]
     assert all(x is not None for x in rels), "every report needs its relative bearing logged"
@@ -217,3 +219,80 @@ class TestGeminiReviewFindings:
     assert out.get("cap") is not None
     assert "last_seen_min" in out["cap"], "cap must carry last_seen_min or the banner splices"
     assert out["cap"]["last_seen_min"] == 0
+
+
+class TestHemisphereHysteresis:
+  """policenear2-2pnw, Fable review 2026-09-08. A hard 90-degree edge made a report sitting abeam
+  toggle in and out every 2-3 s. Replaying the new rule at 1 Hz against the drive's GPS: strict 90
+  gave 37 pick changes / 11 flip-backs within 30 s / 9 displays under 5 s; with a 15-degree hold for
+  the report already shown, 16 / 0 / 0. recede-tracking does NOT bound this -- it retires reports you
+  drive PAST, and a report abeam on a parallel road never recedes past closest approach."""
+
+  @staticmethod
+  def _at(bearing_deg, mi):
+    """A report `mi` away at an absolute bearing from (47.0, -122.0)."""
+    import math
+    R = 3958.8
+    b, d = math.radians(bearing_deg), mi / R
+    p1, l1 = math.radians(47.0), math.radians(-122.0)
+    p2 = math.asin(math.sin(p1) * math.cos(d) + math.cos(p1) * math.sin(d) * math.cos(b))
+    l2 = l1 + math.atan2(math.sin(b) * math.sin(d) * math.cos(p1),
+                         math.cos(d) - math.sin(p1) * math.sin(p2))
+    return math.degrees(p2), math.degrees(l2)
+
+  def _report(self, uuid, bearing_deg, mi):
+    la, lo = self._at(bearing_deg, mi)
+    return {"lat": la, "lon": lo, "magvar": None, "uuid": uuid, "street": "", "town": "T",
+            "thumbs": 0, "ts": (_now_epoch() - 300.0) * 1000.0}
+
+  def test_the_shown_report_is_held_past_90_degrees(self):
+    """The measured case: 5.4 mi at ~86-89.5 deg toggling against 7.2 mi at 74 deg."""
+    recede = lsd._PoliceRecede(lsd.POLICE_RECEDE_MI)
+    near = self._report("near", 88.0, 5.4)
+    far = self._report("far", 74.0, 7.2)
+    a = _line_police([near, far], "ok", "", 47.0, -122.0, 0.0, [], recede)
+    assert a["uuid"] == "near", "inside 90 deg the nearer report wins"
+    # it drifts just past the hard edge -- must NOT hand the slot to the farther report
+    near2 = self._report("near", 96.0, 5.4)
+    b = _line_police([near2, far], "ok", "", 47.0, -122.0, 0.0, [], recede)
+    assert b["uuid"] == "near", "the shown report is held out to 105 deg, so no toggle"
+
+  def test_a_report_never_shown_is_not_admitted_past_90(self):
+    recede = lsd._PoliceRecede(lsd.POLICE_RECEDE_MI)
+    out = _line_police([self._report("fresh", 96.0, 2.0), self._report("ahead", 10.0, 9.0)],
+                       "ok", "", 47.0, -122.0, 0.0, [], recede)
+    assert out["uuid"] == "ahead", "the hold applies ONLY to the incumbent"
+
+  def test_a_nearer_report_still_takes_the_slot_immediately(self):
+    """Admission-only: the hold must never make a farther report win."""
+    recede = lsd._PoliceRecede(lsd.POLICE_RECEDE_MI)
+    held = self._report("held", 88.0, 5.0)
+    _line_police([held], "ok", "", 47.0, -122.0, 0.0, [], recede)
+    held2 = self._report("held", 96.0, 5.0)
+    out = _line_police([held2, self._report("closer", 20.0, 2.0)],
+                       "ok", "", 47.0, -122.0, 0.0, [], recede)
+    assert out["uuid"] == "closer", "ranking is untouched -- a nearer report wins at once"
+
+  def test_the_two_channels_hold_separately(self):
+    """display and cap must not share a hysteresis slot, or the cap pick would hold the DISPLAY's
+    report out to 105 deg (and vice versa). Set them up to differ: a near UNCONFIRMED report takes
+    the display line while a farther CONFIRMED one takes cap."""
+    recede = lsd._PoliceRecede(lsd.POLICE_RECEDE_MI)
+    la1, lo1 = self._at(10.0, 3.0)
+    near_unconf = {"lat": la1, "lon": lo1, "magvar": None, "uuid": "near_unconf", "street": "",
+                   "town": "T", "thumbs": 0, "ts": (_now_epoch() - 3600.0) * 1000.0}   # 60 min -> unconfirmed
+    la2, lo2 = self._at(10.0, 6.0)
+    far_conf = {"lat": la2, "lon": lo2, "magvar": None, "uuid": "far_conf", "street": "",
+                "town": "T", "thumbs": 9, "ts": (_now_epoch() - 60.0) * 1000.0}         # 1 min -> confirmed
+    out = _line_police([near_unconf, far_conf], "ok", "", 47.0, -122.0, 0.0, [], recede)
+    assert out["uuid"] == "near_unconf", "display is proximity-first over the whole set"
+    assert out["cap"]["uuid"] == "far_conf", "cap is the nearest CONFIRMED report"
+    assert recede.last_pick.get("display") == "near_unconf"
+    assert recede.last_pick.get("cap") == "far_conf", "the channels must hold different reports"
+
+  def test_the_hold_is_released_when_nothing_is_selectable(self):
+    recede = lsd._PoliceRecede(lsd.POLICE_RECEDE_MI)
+    _line_police([self._report("x", 88.0, 5.0)], "ok", "", 47.0, -122.0, 0.0, [], recede)
+    assert recede.last_pick.get("display") == "x"
+    _line_police([], "ok", "", 47.0, -122.0, 0.0, [], recede)
+    assert recede.last_pick.get("display") is None, "a stale hold must not survive an empty tick"
