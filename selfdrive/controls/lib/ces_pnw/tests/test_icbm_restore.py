@@ -174,6 +174,12 @@ def test_icbm_step_publishes_inc_marker_and_restore_src(tmp_path, monkeypatch):
   mgr._icbm_floor_lim = 0.0    # curvefloor2pnw
   mgr._icbm_floor_pend = None  # curvefloor2pnw
   mgr._icbm_floor_hit = False  # curvefloor2pnw
+  # icbmconsist2pnw: the polyline reading _icbm_step now consults. 0 / KN 0 makes the
+  # consistency check ABSTAIN, so every pre-existing case here keeps its exact behaviour.
+  mgr._icbm_k = 0.0            # icbmconsist2pnw
+  mgr._icbm_k_n = 0            # icbmconsist2pnw
+  mgr._icbm_k_ahead = False    # icbmconsist2pnw
+  mgr._icbm_consist_hit = False  # icbmconsist2pnw
   step = cls._icbm_step.__get__(mgr)
 
   def run(sig, stock_set, stock_on):

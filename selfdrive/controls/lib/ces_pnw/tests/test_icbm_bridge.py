@@ -144,6 +144,12 @@ def test_icbm_step_gating_chill_vs_ces():
   mgr._icbm_floor_lim = 0.0    # curvefloor2pnw
   mgr._icbm_floor_pend = None  # curvefloor2pnw
   mgr._icbm_floor_hit = False  # curvefloor2pnw
+  # icbmconsist2pnw: the polyline reading _icbm_step now consults. 0 / KN 0 makes the
+  # consistency check ABSTAIN, so every pre-existing case here keeps its exact behaviour.
+  mgr._icbm_k = 0.0            # icbmconsist2pnw
+  mgr._icbm_k_n = 0            # icbmconsist2pnw
+  mgr._icbm_k_ahead = False    # icbmconsist2pnw
+  mgr._icbm_consist_hit = False  # icbmconsist2pnw
   mgr._stock_set = 0.0
   mgr._stock_on = False
   step = cls._icbm_step.__get__(mgr)
@@ -360,6 +366,12 @@ def _icbm_stub(veh):
   mgr._icbm_floor_lim = 0.0    # curvefloor2pnw
   mgr._icbm_floor_pend = None  # curvefloor2pnw
   mgr._icbm_floor_hit = False  # curvefloor2pnw
+  # icbmconsist2pnw: the polyline reading _icbm_step now consults. 0 / KN 0 makes the
+  # consistency check ABSTAIN, so every pre-existing case here keeps its exact behaviour.
+  mgr._icbm_k = 0.0            # icbmconsist2pnw
+  mgr._icbm_k_n = 0            # icbmconsist2pnw
+  mgr._icbm_k_ahead = False    # icbmconsist2pnw
+  mgr._icbm_consist_hit = False  # icbmconsist2pnw
   mgr._stock_set = 0.0
   mgr._stock_on = False
   return mgr, cls._icbm_step.__get__(mgr)

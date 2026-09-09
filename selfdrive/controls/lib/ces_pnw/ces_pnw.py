@@ -1911,6 +1911,10 @@ class CESController:
     self._icbm_floor_lim = 0.0
     self._icbm_floor_pend = None   # (candidate_limit, first_seen) while a RISE settles
     self._icbm_floor_hit = False
+    # icbmconsist2pnw: True on a tick where the polyline consistency check RAISED the target. Surfaced
+    # as icbmCons so a drive can show the check working instead of leaving it to inference -- the same
+    # trap waysel2pnw fell into when its fields never reached ces_events.
+    self._icbm_consist_hit = False
     self._stock_set = 0.0
     self._stock_on = False
     # pullaway2pnw: stateful evidence for the below-floor lead-pull-away exception (monotonic
@@ -2826,6 +2830,7 @@ class CESController:
         self._icbm_floor_lim = 0.0
         self._icbm_floor_pend = None
         self._icbm_floor_hit = False
+        self._icbm_consist_hit = False   # icbmconsist2pnw: never publish a stale hit alongside icbmT=None
         self._icbm_ep.reset()           # icbmrestore2pnw: forced Chill / no data ends any episode
         self.mem_params.put_nonblocking("IcbmTarget", {})
         return
@@ -2936,6 +2941,30 @@ class CESController:
           self._icbm_floor_hit = False
       else:
         self._icbm_floor_hit = False
+      # icbmconsist2pnw: POLYLINE CONSISTENCY CHECK -- the other half of the floor above, covering the
+      # band the floor cannot (spd_lim > ICBM_FLOOR_MAX_LIMIT). mapd's target implies a curvature
+      # (A_LAT/v^2); the polyline in the SAME message measures the real geometry (icbmcurv2pnw's
+      # icbmK/icbmKN, computed above and telemetry-only until now). When mapd demands far more
+      # curvature than the geometry supports, RAISE the target to what the margin allows.
+      #
+      # Placed HERE, after the penalties and the floor and before _icbm_ep.step, for the same reason
+      # curvefloor2pnw is: the adjusted value is what the ratchet confirms and publishes, and a RAISE
+      # can never trip the ratchet's outlier-DROP gate.
+      #
+      # RAISE-ONLY and bounded by `ref`, exactly like the floor: this can only make ICBM slow LESS. It
+      # cannot create a slowdown, cannot deepen one, and on any unusable input it abstains and leaves
+      # the pre-existing behaviour. Caught the 2026-09-08 20:28 phantom (44.9 -> 50.8 mph) while the
+      # REAL 19:44 on-ramp curve the same evening still gets 44.3 mph -- below the 46.3 mph its
+      # measured R=172 m needs. See ces_pnw_constants.icbm_curvature_sanity for the margin arithmetic.
+      self._icbm_consist_hit = False
+      if target is not None:
+        adj, fired = C.icbm_curvature_sanity(target, sig.get("spd_lim", 0.0),
+                                             self._icbm_k, self._icbm_k_n, self._icbm_k_ahead,
+                                             self._icbm_src, VTSC_A_LAT)
+        if fired:
+          capped = min(adj, ref)                 # never above what the driver/episode already allows
+          self._icbm_consist_hit = capped > target + 1e-9
+          target = capped
       # icbmrestore2pnw: run the episode machine — it forwards caps unchanged ('dec'), enters the
       # bounded GUARDED restore when the curve clears, and hard-aborts on any driver-intent signal.
       driver_pedal = bool(sig.get("gas")) or bool(sig.get("brake"))
@@ -3024,6 +3053,9 @@ class CESController:
       tele["icbmKV"] = round(float(self._icbm_k_v), 1)
       tele["icbmKN"] = int(self._icbm_k_n)
       tele["icbmKAhead"] = bool(self._icbm_k_ahead)
+      # icbmconsist2pnw: did the polyline check RAISE the target this tick? Without this the check is
+      # invisible in a drive log and "it never fired" is indistinguishable from "it is not wired".
+      tele["icbmCons"] = bool(self._icbm_consist_hit)
       tele["icbmFlr"] = round(float(self._icbm_floor_lim), 1)
       tele["icbmFlrHit"] = bool(self._icbm_floor_hit)
       tele["icbmDir"] = self._icbm_dir           # icbmrestore2pnw: "dec" capping / "inc" restoring
@@ -3183,6 +3215,8 @@ class CESController:
       "icbmK": round(float(self._icbm_k), 6), "icbmKD": round(float(self._icbm_k_dist), 0),
       "icbmKV": round(float(self._icbm_k_v), 1), "icbmKN": int(self._icbm_k_n),
       "icbmKAhead": bool(self._icbm_k_ahead),
+      "icbmCons": bool(self._icbm_consist_hit),     # icbmconsist2pnw
+
       "icbmFlr": round(float(self._icbm_floor_lim), 1), "icbmFlrHit": bool(self._icbm_floor_hit),
       "icbmDir": self._icbm_dir,   # icbmrestore2pnw: "inc" rows in ces_events = restore taps
       "stockSet": self._stock_set, "stockOn": self._stock_on,

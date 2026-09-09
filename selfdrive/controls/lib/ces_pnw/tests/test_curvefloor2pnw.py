@@ -139,6 +139,12 @@ def _rig(tmp_path, monkeypatch):
   g._icbm_floor_lim = 0.0
   g._icbm_floor_pend = None
   g._icbm_floor_hit = False
+  # icbmconsist2pnw: the polyline reading _icbm_step now consults. 0 / KN 0 makes the consistency
+  # check ABSTAIN, so every floor case here keeps its exact pre-existing behaviour.
+  g._icbm_k = 0.0              # icbmconsist2pnw
+  g._icbm_k_n = 0              # icbmconsist2pnw
+  g._icbm_k_ahead = False      # icbmconsist2pnw
+  g._icbm_consist_hit = False  # icbmconsist2pnw
   g._icbm_gate = None
   g._icbm_map_reach = None
   g._stock_set = 0.0

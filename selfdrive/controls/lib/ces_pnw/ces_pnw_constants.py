@@ -5,6 +5,8 @@ ALL values are starting points to be finalized on real drive logs (see CES.md "c
 anchors": I-5 Terwilliger ~2.0 m/s² @ 50 mph must trip; the R≈550 m curve must be easy @70 / hard
 @90). Lateral acceleration is v²·curvature, so curve triggering is speed-adaptive.
 """
+import math
+
 from openpilot.common.constants import CV
 
 # --- speed thresholds (stored in m/s; UI exposes mph) -----------------------
@@ -351,6 +353,100 @@ ICBM_FLOOR_MAX_LIMIT = 13.5    # m/s; INCLUSIVE of a real 30 mph = 30 * 0.44704 
 # forever; the event window floored at 8.45 m/s = 19 mph, not the 10.73 = 24 mph the feature was
 # written for). Flicker and a real change are the SAME SIZE; only their PERSISTENCE differs.
 ICBM_FLOOR_RISE_HOLD_S = 3.0   # a higher limit must persist this long before the floor follows it up
+
+
+# ---------------------------------------------------------------------------------------------------
+# icbmconsist2pnw (2026-09-08) -- the POLYLINE CONSISTENCY CHECK, the other half of the floor above.
+#
+# THE DEFECT, caught live: 20:28:51 PT on a 60 mph motorway, mapd claimed a curve and ICBM commanded
+# 44.9 mph; the stock set was dragged 70 -> 44 mph. There was no curve. Measured on the same ticks:
+# curvePct 100 with curveSrc "map" while achLat sat at -0.05..-1.1 m/s^2 and vision reported nothing.
+#
+# WHY THE EXISTING GUARDS DID NOT CATCH IT:
+#   * the posted-limit floor above is INERT here by construction -- ICBM_FLOOR_MAX_LIMIT is 13.5 m/s
+#     (30 mph) and the limit was 26.8 (60 mph), so icbmFlr read 0.0 on all 1136 ticks of that drive;
+#   * curveWin / vtscCap / mapK / apexCurvature are ALL dead on this truck (0 or "none" on every one
+#     of those 1136 ticks), because op-long is False so vtsc's cap() early-returns. A clamp gated on
+#     any of them fires every tick and suppresses EVERY slowdown, real ones included.
+#
+# WHY DROP SIZE CANNOT BE THE TEST -- the trap that killed the obvious fix. The phantom above and the
+# REAL I-5 on-ramp curve at 19:44:07 the same evening have the same drop (25.9 vs 26.0 mph), the same
+# posted limit (60), the same road class, and both are map-sourced. The on-ramp was genuinely hard:
+# 3.13 m/s^2 achieved, R ~= 172 m, and the truck ran out of steering (`steerEvent angSat` twice)
+# before the driver took the wheel. Any threshold on depth suppresses that one too.
+#
+# WHAT DOES DISCRIMINATE: mapd's own velocity implies a curvature (kappa = A_LAT / v^2). The polyline
+# in the SAME message is an independent measurement of the real geometry -- icbmcurv2pnw already
+# computes it here (`icbmK`/`icbmKN`, telemetry-only until now; its comment says outright that
+# measuring on this path "is the prerequisite for any consistency check"). On the phantom mapd implied
+# R = 197 m against a polyline R of 310-350 m; reality was ~580 m.
+#
+# THE RULE: if mapd demands MORE curvature than the polyline supports by more than ICBM_CONSIST_MARGIN,
+# raise the target to what that margin allows. RAISE-ONLY -- it can only ever make ICBM slow LESS, so
+# it cannot introduce a new slowdown, and it is bounded above by the caller's `ref` like the floor is.
+#
+# THE MARGIN IS LOAD-BEARING, and it is tuned on n=2 events -- treat it as provisional. Replayed
+# against both real episodes (A = the phantom, C = the real on-ramp curve):
+#     M = 1.5  ->  A: 44.9 -> 50.8 mph (the 70->44 becomes 70->51)
+#                  C: 34.0 -> 44.3 mph, still BELOW the 46.3 mph that R=172 m needs at A_LAT -- SURVIVES
+#     M = 1.0  ->  C: 34.0 -> 54.3 mph, ABOVE the 52 mph at which this truck's steering saturated
+#                  on that very curve. DANGEROUS. Do not lower this without redoing that arithmetic.
+# The polyline under-read C by ~1.4x (R 236 m measured vs 172 m achieved), which is exactly what the
+# margin is absorbing. Widen it, never narrow it, without new evidence.
+ICBM_CONSIST_MARGIN = 1.5
+# Below this many polyline points the measurement is not trustworthy enough to overrule mapd. On the
+# 2026-09-08 drive this alone abstained on the whole 19:28 episode (KN 0-2).
+ICBM_CONSIST_MIN_KN = 3
+# ...and a near-zero curvature is AMBIGUOUS, not "straight": polyline_curvature's own contract says
+# `icbmKN > 0 and icbmK ~= 0` does NOT mean no curve. Trusting a ~0 reading would drive the allowed
+# curvature to ~0 and raise every target to infinity -- i.e. silently disable ICBM, the exact
+# suppress-everything direction this whole design exists to avoid. 0.001 = R 1000 m.
+ICBM_CONSIST_MIN_K = 0.001
+# SCOPE: only where the posted-limit floor is inert. The two are complementary halves of one idea --
+# below 30 mph the floor guarantees a holdable target from the posted limit; above it, nothing did.
+# This also keeps the check away from tight low-speed geometry, where the polyline sampling is
+# coarsest relative to the radius (verified: on the 25 mph roads of the same drive it abstains).
+
+
+def icbm_curvature_sanity(target, spd_lim, poly_k, poly_kn, poly_ahead, src, a_lat,
+                          margin=ICBM_CONSIST_MARGIN,
+                          min_kn=ICBM_CONSIST_MIN_KN, min_k=ICBM_CONSIST_MIN_K,
+                          scope_above=ICBM_FLOOR_MAX_LIMIT):
+  """Raise a MAP-sourced ICBM target that demands more curvature than the polyline supports.
+
+  Returns (target, fired). RAISE-ONLY: the returned target is >= the input, always, so this can only
+  reduce how much ICBM slows -- it can never command a new or deeper slowdown.
+
+  `a_lat` is REQUIRED, not defaulted: A_LAT_TARGET lives in vtsc_constants, and importing it here
+  just to default one number would add a cross-module dependency the caller does not need -- it
+  already holds the value, and passing it explicitly keeps this function pure and independently
+  testable at any a_lat.
+
+  Pure and total. Any unusable input ABSTAINS (returns the target unchanged) rather than guessing:
+  abstaining leaves the pre-existing behaviour, which is the fail-safe direction for a check whose
+  failure mode would otherwise be suppressing a real curve.
+  """
+  try:
+    if target is None or not (target > 0.0) or target != target:
+      return target, False
+    if src not in ("map", "far"):
+      return target, False                       # vision has its own evidence; never second-guess it
+    spd_lim = float(spd_lim or 0.0)
+    if not (spd_lim > scope_above):
+      return target, False                       # the posted-limit floor owns this band
+    if poly_kn is None or int(poly_kn) < min_kn or not poly_ahead:
+      return target, False                       # too few points, or the curvature is not ahead of us
+    poly_k = float(poly_k or 0.0)
+    if not (poly_k > min_k) or poly_k != poly_k:
+      return target, False                       # ~0 is ambiguous, not "straight" -- see above
+    k_map = a_lat / (target * target)            # the curvature mapd's own target implies
+    k_allowed = poly_k * margin
+    if k_map <= k_allowed:
+      return target, False                       # mapd and the geometry agree well enough
+    return math.sqrt(a_lat / k_allowed), True
+  except (TypeError, ValueError, ZeroDivisionError):
+    return target, False
+
 
 
 def icbm_floor_limit(spd_lim: float, prev: float, now: float = 0.0, pending=None):
