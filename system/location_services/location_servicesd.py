@@ -1021,10 +1021,12 @@ _police_bad_coord_seen: set = set()
 def _police_bad_coord(al, chan):
   """Rule 2: a report we cannot place is DROPPED, and a drop must never be silent.
 
-  Fable review 2026-09-08: malformed/NaN coordinates were skipped by a bare `except: continue`, and
-  the forensics entry for that report is ALSO lost (its own builder raises on the same float()), so a
-  proxy emitting bad rows was invisible in every channel at once -- while the driver's rule is
-  precisely that a report must never be missed. Logged ONCE per uuid per process: a broken upstream
+  Fable review 2026-09-08: malformed/NaN coordinates were skipped by a bare `except: continue`, so a
+  proxy emitting bad rows was invisible -- while the driver's rule is precisely that a report must
+  never be missed. The forensics entry MAY be lost too, but only for a non-numeric coordinate, whose
+  float() raises in the builder as well; a NaN one is still logged there (float("nan") does not
+  raise -- that is the whole premise of the NaN finding). An earlier version of this docstring and
+  the warning text claimed the entry was always lost, which was wrong (Fable round 2, F2). Logged ONCE per uuid per process: a broken upstream
   row repeats on every 1 Hz tick, and an unthrottled warning would flood the log it needs to be
   visible in."""
   try:
@@ -1034,7 +1036,7 @@ def _police_bad_coord(al, chan):
     _police_bad_coord_seen.add(key)
     if len(_police_bad_coord_seen) > 500:       # bound it over a multi-drive daemon lifetime
       _police_bad_coord_seen.clear()
-    cloudlog.warning("police: DROPPING an unplaceable report -- not shown, and absent from the forensics log too (chan=%s uuid=%s lat=%r lon=%r)",
+    cloudlog.warning("police: DROPPING an unplaceable report -- not shown, and it MAY be missing from the forensics log too (chan=%s uuid=%s lat=%r lon=%r)",
                      chan, al.get("uuid"), al.get("lat"), al.get("lon"))
   except Exception:
     cloudlog.exception("police: _police_bad_coord failed")
@@ -1074,6 +1076,11 @@ def _police_debug_log(dbg, poi, lat, lon, brg):
 
 def _line_police(alerts, state, err, lat, lon, brg, path, recede):
   if state != "ok":
+    # policenear2-2pnw (Fable round 2, F1): this return bypasses _select, so the hemisphere hold
+    # would survive the gap -- a poll failure, the 43 mph speed gate disarming, or an LTE dropout --
+    # and then admit a stale report at up to 105 deg on the far side. `last_pick` is NOT covered by
+    # recede.prune(), which only bounds min_d/passed to the current pull. Drop it with the feed.
+    recede.last_pick.clear()
     return {"state": "nodata", "err": err} if err else {"state": "nodata"}
   now = _now_epoch()
   recede.prune(alerts)                           # bound tracking state to the current Waze pull
@@ -1109,7 +1116,12 @@ def _line_police(alerts, state, err, lat, lon, brg, path, recede):
                   # "was the pick even ahead of us?" is answerable from the file alone. Also
                   # `last_seen` age, so feed LATENCY (the larger miss mechanism: median 15 min old at
                   # first sighting) is measurable without diffing consecutive records.
-                  "rel": (None if brg is None else
+                  # Fable round 2 (F5): al["lat"] would raise KeyError here, and the enclosing
+                  # try catches only (TypeError, ValueError) -- so a report without coordinates would
+                  # propagate out of _line_police, which main()'s loop does not guard. Unreachable
+                  # today (both pollers float() lat/lon at parse), but a proxy change should not be
+                  # able to kill the daemon. .get() keeps it a dropped row, not a crash.
+                  "rel": (None if brg is None or al.get("lat") is None or al.get("lon") is None else
                           round(abs(geo.normalize180(geo.bearing_deg(lat, lon, float(al["lat"]),
                                                                      float(al["lon"])) - brg)), 1)),
                   "seen_min": (None if al.get("last_seen") is None
@@ -1167,7 +1179,10 @@ def _line_police(alerts, state, err, lat, lon, brg, path, recede):
       # Rank on the UNROUNDED distance. recede.live_mi() rounds to 0.1 mi, which creates ties: two
       # reports at 4.04 and 3.96 mi both read 4.0, the tie-break picks one, and 0.02 mi later they
       # separate and it flips (Gemini review). live_mi stays the PUBLISHED value; ordering uses this.
-      # NaN-safe by construction (Gemini review, a real regression vs the old code): json.loads
+      # NaN-safe by construction (Gemini review). NOT a regression -- the old near-lock had the
+      # identical hole (`d > POLICE_NEAR_MI` is also False for NaN, and its min() would also return
+      # the NaN entry when it sorted first); only the >1 mi branch was incidentally safe. An earlier
+      # commit message called it a regression; that was an overclaim (Fable round 2, F3). json.loads
       # accepts a bare `NaN` literal and float("nan") does not raise, so a bad coordinate from the
       # proxy yields NaN here. Every NaN comparison is False, so `d > DISPLAY_MAX_MI` would NOT
       # reject it, and min() would then return it if it sorted first -- silently discarding every

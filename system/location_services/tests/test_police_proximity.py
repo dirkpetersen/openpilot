@@ -178,11 +178,12 @@ class TestGeminiReviewFindings:
   """Defects found by the Gemini review of the first cut of this change (2026-09-08)."""
 
   def test_a_nan_coordinate_cannot_swallow_every_valid_report(self):
-    """REAL REGRESSION vs the shipped code. json.loads accepts a bare NaN literal and float("nan")
-    does not raise, so a bad proxy coordinate reaches _select as NaN. Every NaN comparison is False,
-    so the range and hemisphere tests do NOT reject it, and min() returns it when it sorts first --
-    silently discarding every valid report. The old code skipped it only incidentally (its
-    `NaN < best_along` is also False)."""
+    """json.loads accepts a bare NaN literal and float("nan") does not raise, so a bad proxy
+    coordinate reaches _select as NaN. Every NaN comparison is False, so the range and hemisphere
+    tests do NOT reject it, and min() returns it when it sorts first -- silently discarding every
+    valid report. NOT a regression: the old near-lock had the identical hole; only its >1 mi branch
+    was incidentally safe (`NaN < best_along` is also False). An earlier version of this docstring
+    called it a regression -- an overclaim (Fable round 2)."""
     nan_alert = {"lat": float("nan"), "lon": -122.0, "magvar": None, "uuid": "nan1", "street": "",
                  "town": "T", "thumbs": 0, "ts": (_now_epoch() - 300.0) * 1000.0}
     out = _line([nan_alert, _alert("good", 3.0)])          # NaN FIRST -- the poisoning order
@@ -296,3 +297,32 @@ class TestHemisphereHysteresis:
     assert recede.last_pick.get("display") == "x"
     _line_police([], "ok", "", 47.0, -122.0, 0.0, [], recede)
     assert recede.last_pick.get("display") is None, "a stale hold must not survive an empty tick"
+
+
+class TestFableRoundTwo:
+  def test_the_hold_is_dropped_when_the_feed_goes_away(self):
+    """F1: the `state != "ok"` return bypasses _select, so without this the hemisphere hold would
+    survive a poll failure / speed-gate disarm / GPS dropout and then admit a stale report out to
+    105 deg on the far side of the gap. recede.prune() does not cover last_pick."""
+    recede = lsd._PoliceRecede(lsd.POLICE_RECEDE_MI)
+    hold = TestHemisphereHysteresis()._report("held", 88.0, 5.0)
+    _line_police([hold], "ok", "", 47.0, -122.0, 0.0, [], recede)
+    assert recede.last_pick.get("display") == "held"
+    _line_police([], "nodata", "timeout", 47.0, -122.0, 0.0, [], recede)   # the gap
+    assert recede.last_pick == {}, "the hold must not survive a non-ok tick"
+    # ...and after the gap the stale report gets no special admission
+    drifted = TestHemisphereHysteresis()._report("held", 100.0, 5.0)
+    other = TestHemisphereHysteresis()._report("other", 20.0, 9.0)
+    out = _line_police([drifted, other], "ok", "", 47.0, -122.0, 0.0, [], recede)
+    assert out["uuid"] == "other", "a report past 90 deg must not be resurrected by a stale hold"
+
+  def test_a_report_without_coordinates_does_not_kill_the_daemon(self):
+    """F5: the forensics `rel` builder did float(al["lat"]) inside a try catching only
+    (TypeError, ValueError), so a coordinate-less report raised KeyError out of _line_police --
+    and main()'s loop has no guard. Unreachable in production, but a proxy change must not be able
+    to crash the daemon."""
+    broken = {"magvar": None, "uuid": "nolatlon", "street": "", "town": "T", "thumbs": 0,
+              "ts": (_now_epoch() - 300.0) * 1000.0}
+    out = _line([broken, _alert("good", 3.0)])          # must not raise
+    assert out["state"] == "alert"
+    assert out["dist_mi"] == pytest.approx(3.0, abs=0.2)
