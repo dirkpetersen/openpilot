@@ -290,6 +290,9 @@ class TestOverlayFeed:
     # bound explicitly: the permissive `__getattr__ -> None` would otherwise shadow the real method
     g._event_record = cls._event_record.__get__(g)
     g._icbm_k, g._icbm_k_dist, g._icbm_k_v, g._icbm_k_n, g._icbm_k_ahead = 0.004, 180.0, 25.0, 6, True
+    # icbmconsist2pnw: the POINT-MATCHED reading rides the same feeds. The permissive
+    # `__getattr__ -> None` would otherwise reach float(None) and take the whole publish down.
+    g._icbm_k_at, g._icbm_k_at_d, g._icbm_k_at_n, g._icbm_k_at_gap = 0.0021, 210.0, 4, 30.0
     for k, v in over.items():
       setattr(g, k, v)
     cls._publish_status.__get__(g)(None, False)
@@ -303,6 +306,25 @@ class TestOverlayFeed:
     assert st["icbmKV"] == pytest.approx(25.0)
     assert st["icbmKN"] == 6
     assert st["icbmKAhead"] is True
+
+  def test_the_point_matched_reading_reaches_the_overlay(self):
+    """icbmconsist2pnw. Its whole purpose is to be READ from drive logs, so a field that silently
+    fails to reach the feed is the same as not having built it -- [[vtscstatus-telemetry-not-logged]].
+    icbmKAtGap is the load-bearing one: it says whether comparing mapd's claim to the polyline is
+    legitimate on that tick at all."""
+    st = self._status()
+    assert st["icbmKAt"] == pytest.approx(0.0021)
+    assert st["icbmKAtD"] == pytest.approx(210.0)
+    assert st["icbmKAtN"] == 4
+    assert st["icbmKAtGap"] == pytest.approx(30.0)
+
+  def test_the_point_matched_reading_tracks_the_controller(self):
+    """A constant or a coarse round on any of them would otherwise sail through."""
+    st = self._status(_icbm_k_at=0.000456, _icbm_k_at_d=77.0, _icbm_k_at_n=9, _icbm_k_at_gap=143.0)
+    assert st["icbmKAt"] == pytest.approx(0.000456)
+    assert st["icbmKAtD"] == pytest.approx(77.0)
+    assert st["icbmKAtN"] == 9
+    assert st["icbmKAtGap"] == pytest.approx(143.0)
 
   def test_every_overlay_value_tracks_the_controller(self):
     """All five, at a resolution a coarser rounding would destroy -- a constant or a 3-decimal

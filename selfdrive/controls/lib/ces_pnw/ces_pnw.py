@@ -40,7 +40,7 @@ from openpilot.selfdrive.controls.lib.pnw_vehicle import PnwVehicle
 # descentcurve2pnw: MAP_SOURCE_HORIZON_M is mapd's hard 500 m path cap — ICBM's full-horizon map scan
 # uses the same constant family as VTSC/MTSC so both scan exactly what mapd publishes.
 # icbmcurv2pnw: the SAME pure measurement VTSC uses, run on the ICBM path too (see below).
-from openpilot.selfdrive.controls.lib.vtsc_pnw.vtsc_pnw import polyline_curvature
+from openpilot.selfdrive.controls.lib.vtsc_pnw.vtsc_pnw import polyline_curvature, polyline_curvature_at
 from openpilot.selfdrive.controls.lib.vtsc_pnw.vtsc_constants import (A_LAT_TARGET as VTSC_A_LAT,
                                                                       MAP_SOURCE_HORIZON_M,
                                                                       MAP_SCALE_MIN)
@@ -250,6 +250,9 @@ ICBM_VISION_EPS = 0.05                          # m/s^2 floor inside the sqrt (n
 ICBM_MAP_HORIZON_M = MAP_SOURCE_HORIZON_M   # m; scan the FULL published map path
 ICBM_FIRM_DROP_LO = 13.4    # m/s (~30 mph) required drop where the approach decel starts firming
 ICBM_FIRM_DROP_HI = 26.8    # m/s (~60 mph) required drop where it reaches the firm ceiling
+
+
+ICBM_ERR_LOG_S = 30.0   # rule-2: throttle the _icbm_step failure log (it runs at ~4 Hz)
 
 
 def icbm_approach_decel(v_ego, apex, firm_decel=0.0, a_base=ICBM_A_DECEL,
@@ -1911,10 +1914,14 @@ class CESController:
     self._icbm_floor_lim = 0.0
     self._icbm_floor_pend = None   # (candidate_limit, first_seen) while a RISE settles
     self._icbm_floor_hit = False
-    # icbmconsist2pnw: True on a tick where the polyline consistency check RAISED the target. Surfaced
-    # as icbmCons so a drive can show the check working instead of leaving it to inference -- the same
-    # trap waysel2pnw fell into when its fields never reached ces_events.
-    self._icbm_consist_hit = False
+    # icbmconsist2pnw: the POINT-MATCHED polyline reading beside mapd's own target -- telemetry only,
+    # nothing reads these for control. icbmKAtGap is the load-bearing one: it says how far the nearest
+    # measurable triplet fell from mapd's point, i.e. whether comparing them is legitimate at all.
+    self._icbm_k_at = 0.0
+    self._icbm_k_at_d = 0.0
+    self._icbm_k_at_n = 0
+    self._icbm_k_at_gap = 0.0
+    self._icbm_err_last = -1e9      # rule-2 throttle for the _icbm_step failure log below
     self._stock_set = 0.0
     self._stock_on = False
     # pullaway2pnw: stateful evidence for the below-floor lead-pull-away exception (monotonic
@@ -2830,7 +2837,11 @@ class CESController:
         self._icbm_floor_lim = 0.0
         self._icbm_floor_pend = None
         self._icbm_floor_hit = False
-        self._icbm_consist_hit = False   # icbmconsist2pnw: never publish a stale hit alongside icbmT=None
+        # icbmconsist2pnw: never publish a stale point-match alongside icbmT=None
+        self._icbm_k_at = 0.0
+        self._icbm_k_at_d = 0.0
+        self._icbm_k_at_n = 0
+        self._icbm_k_at_gap = 0.0
         self._icbm_ep.reset()           # icbmrestore2pnw: forced Chill / no data ends any episode
         self.mem_params.put_nonblocking("IcbmTarget", {})
         return
@@ -2941,30 +2952,47 @@ class CESController:
           self._icbm_floor_hit = False
       else:
         self._icbm_floor_hit = False
-      # icbmconsist2pnw: POLYLINE CONSISTENCY CHECK -- the other half of the floor above, covering the
-      # band the floor cannot (spd_lim > ICBM_FLOOR_MAX_LIMIT). mapd's target implies a curvature
-      # (A_LAT/v^2); the polyline in the SAME message measures the real geometry (icbmcurv2pnw's
-      # icbmK/icbmKN, computed above and telemetry-only until now). When mapd demands far more
-      # curvature than the geometry supports, RAISE the target to what the margin allows.
+      # icbmconsist2pnw: POINT-MATCHED POLYLINE CURVATURE -- TELEMETRY ONLY. NOTHING HERE TOUCHES
+      # CONTROL, deliberately.
       #
-      # Placed HERE, after the penalties and the floor and before _icbm_ep.step, for the same reason
-      # curvefloor2pnw is: the adjusted value is what the ratchet confirms and publishes, and a RAISE
-      # can never trip the ratchet's outlier-DROP gate.
+      # THE GOAL: the 2026-09-08 20:28 phantom (mapd claimed a curve on a straight 60 mph motorway;
+      # ICBM dragged the set 70 -> 44 mph) needs mapd's velocity checked against real geometry. The
+      # polyline in mapd's own message is that geometry, and icbmcurv2pnw already measures it.
       #
-      # RAISE-ONLY and bounded by `ref`, exactly like the floor: this can only make ICBM slow LESS. It
-      # cannot create a slowdown, cannot deepen one, and on any unusable input it abstains and leaves
-      # the pre-existing behaviour. Caught the 2026-09-08 20:28 phantom (44.9 -> 50.8 mph) while the
-      # REAL 19:44 on-ramp curve the same evening still gets 44.3 mph -- below the 46.3 mph its
-      # measured R=172 m needs. See ces_pnw_constants.icbm_curvature_sanity for the margin arithmetic.
-      self._icbm_consist_hit = False
-      if target is not None:
-        adj, fired = C.icbm_curvature_sanity(target, sig.get("spd_lim", 0.0),
-                                             self._icbm_k, self._icbm_k_n, self._icbm_k_ahead,
-                                             self._icbm_src, VTSC_A_LAT)
-        if fired:
-          capped = min(adj, ref)                 # never above what the driver/episode already allows
-          self._icbm_consist_hit = capped > target + 1e-9
-          target = capped
+      # WHY THIS IS NOT WIRED, having been built wired and then rejected on the evidence: the
+      # existing `icbmK` is the horizon MAXIMUM curvature, not the curvature at MAPD'S point. A
+      # review replaying all 4077 ticks of that drive found the two points were 51-328 m apart on
+      # every one of the 28 ticks a check would have fired -- never closer than 50 m -- so it was
+      # never actually comparing mapd's claim to mapd's curve. On 19:37:47 it contradicted a CORRECT
+      # mapd claim (a ramp at R~=38 m, 22 m ahead) using an unrelated gentler curve 172 m further on,
+      # and would have suppressed a real slowdown on R 62-172 m geometry. It also fired on 28 of 28
+      # eligible ticks with ZERO reading consistent -- a consistency check that never finds
+      # consistency is measuring a systematic offset (the pipeline's own scale and penalty factors),
+      # not discriminating. And the polyline's under-read tail is p99 3.29x, far beyond any margin
+      # that keeps a real curve safe.
+      #
+      # So: measure first, wire later. `icbmKAt` is the curvature at mapd's OWN target distance and
+      # `icbmKAtGap` is how far off the nearest measurable triplet landed -- the number that says
+      # whether a comparison is legitimate at all. Same telemetry-first discipline icbmcurv2pnw used
+      # before anything read icbmK. Wire a check only once real drives show icbmKAtGap is routinely
+      # small; on the one drive we have, it never was.
+      self._icbm_k_at = 0.0
+      self._icbm_k_at_d = 0.0
+      self._icbm_k_at_n = 0
+      self._icbm_k_at_gap = 0.0
+      if target is not None and self._icbm_src in ("map", "far") and self._map_targets:
+        try:
+          at_d = {"map": sig.get("map_target_dist", float("inf")), "far": far_dist}.get(self._icbm_src)
+          if at_d is not None and math.isfinite(float(at_d)):
+            kat, katd, katn, katgap, _ = polyline_curvature_at(
+              self._map_targets, self._cur_lat, self._cur_lon, MAP_SOURCE_HORIZON_M,
+              float(at_d), self._cur_bearing)
+            self._icbm_k_at = float(kat)
+            self._icbm_k_at_d = float(katd)
+            self._icbm_k_at_n = int(katn)
+            self._icbm_k_at_gap = float(katgap)
+        except (TypeError, ValueError):
+          pass                # measurement only; a bad map_target_dist must not disturb control
       # icbmrestore2pnw: run the episode machine — it forwards caps unchanged ('dec'), enters the
       # bounded GUARDED restore when the curve clears, and hard-aborts on any driver-intent signal.
       driver_pedal = bool(sig.get("gas")) or bool(sig.get("brake"))
@@ -2994,7 +3022,28 @@ class CESController:
       else:
         self.mem_params.put_nonblocking("IcbmTarget", {})
     except Exception:
-      pass
+      # RULE 2. This `except` used to be a bare `pass`, and it bit during this very change: a missing
+      # attribute raised here, the publish never happened, and the ONLY symptom was a test failing
+      # downstream on an absent target. In production the symptom is worse and quieter -- no
+      # IcbmTarget publish means the Ford executor stale-stops after 2 s and ICBM is simply DEAD for
+      # the rest of the drive, with nothing anywhere saying so.
+      # Still swallowed (this must never raise into the control loop), but no longer silent.
+      # Throttled: at ~4 Hz a persistent fault would otherwise flood the log it needs to be seen in.
+      # getattr with a default, not self._icbm_err_last: this runs on the failure path, and an
+      # AttributeError HERE would escape the except and reach the control loop -- an error handler
+      # that can itself raise is worse than none. (Caught by a stub that lacked the field.)
+      try:
+        now_w = time.monotonic()
+        due = now_w - getattr(self, "_icbm_err_last", -1e9) > ICBM_ERR_LOG_S
+        if due:
+          self._icbm_err_last = now_w
+      except Exception:
+        due = False
+      if due:
+        try:
+          cloudlog.exception("icbm: _icbm_step FAILED -- no IcbmTarget published; the executor will stale-stop and ICBM is inert until this clears")
+        except Exception:
+          pass                      # logging must not become the thing that raises
 
   def _publish_status(self, sig, want: bool) -> None:
     """Log mode transitions and publish a throttled CESStatus snapshot to the in-memory param store
@@ -3053,9 +3102,13 @@ class CESController:
       tele["icbmKV"] = round(float(self._icbm_k_v), 1)
       tele["icbmKN"] = int(self._icbm_k_n)
       tele["icbmKAhead"] = bool(self._icbm_k_ahead)
-      # icbmconsist2pnw: did the polyline check RAISE the target this tick? Without this the check is
-      # invisible in a drive log and "it never fired" is indistinguishable from "it is not wired".
-      tele["icbmCons"] = bool(self._icbm_consist_hit)
+      # icbmconsist2pnw: the POINT-MATCHED reading beside mapd's own claim. icbmKAtGap says how far
+      # the nearest measurable triplet fell from mapd's point -- i.e. whether comparing the two is
+      # legitimate on this tick at all. Telemetry only; nothing consumes these for control yet.
+      tele["icbmKAt"] = round(float(self._icbm_k_at), 6)
+      tele["icbmKAtD"] = round(float(self._icbm_k_at_d), 0)
+      tele["icbmKAtN"] = int(self._icbm_k_at_n)
+      tele["icbmKAtGap"] = round(float(self._icbm_k_at_gap), 0)
       tele["icbmFlr"] = round(float(self._icbm_floor_lim), 1)
       tele["icbmFlrHit"] = bool(self._icbm_floor_hit)
       tele["icbmDir"] = self._icbm_dir           # icbmrestore2pnw: "dec" capping / "inc" restoring
@@ -3215,7 +3268,9 @@ class CESController:
       "icbmK": round(float(self._icbm_k), 6), "icbmKD": round(float(self._icbm_k_dist), 0),
       "icbmKV": round(float(self._icbm_k_v), 1), "icbmKN": int(self._icbm_k_n),
       "icbmKAhead": bool(self._icbm_k_ahead),
-      "icbmCons": bool(self._icbm_consist_hit),     # icbmconsist2pnw
+      # icbmconsist2pnw (telemetry only)
+      "icbmKAt": round(float(self._icbm_k_at), 6), "icbmKAtD": round(float(self._icbm_k_at_d), 0),
+      "icbmKAtN": int(self._icbm_k_at_n), "icbmKAtGap": round(float(self._icbm_k_at_gap), 0),
 
       "icbmFlr": round(float(self._icbm_floor_lim), 1), "icbmFlrHit": bool(self._icbm_floor_hit),
       "icbmDir": self._icbm_dir,   # icbmrestore2pnw: "inc" rows in ces_events = restore taps

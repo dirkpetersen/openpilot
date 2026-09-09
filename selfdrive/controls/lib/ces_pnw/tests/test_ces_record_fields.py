@@ -54,6 +54,11 @@ def _record(**over):
   # icbmcurv2pnw: the record float()s these, so the permissive `__getattr__ -> None` stub cannot
   # supply them. Defaults chosen as a MEASURED gentle bend (not zeros) so a test that forgets to
   # override still distinguishes "reached the record" from "read a default".
+  # icbmconsist2pnw: the record float()s the point-matched trio too, same reason as above.
+  g._icbm_k_at = 0.0021
+  g._icbm_k_at_d = 210.0
+  g._icbm_k_at_n = 4
+  g._icbm_k_at_gap = 30.0
   g._icbm_k = 0.004
   g._icbm_k_dist = 180.0
   g._icbm_k_v = 25.0

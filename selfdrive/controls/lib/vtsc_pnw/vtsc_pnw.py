@@ -279,6 +279,85 @@ def polyline_curvature(points, cur_lat, cur_lon, horizon_m, a_lat=C.A_LAT_TARGET
   return best_k, best_d, vs, n_ok, best_ahead
 
 
+def polyline_curvature_at(points, cur_lat, cur_lon, horizon_m, at_dist_m, cur_bearing=None):
+  """Curvature of the polyline AT a given distance ahead — the POINT-MATCHED companion to
+  polyline_curvature(), which returns the horizon MAXIMUM instead.
+
+  Returns (k, dist_m, n_ok, gap_m, ahead): k is 1/m at the measurable triplet whose middle node is
+  closest to `at_dist_m`, dist_m where that actually landed, n_ok how many triplets passed the
+  spacing gate at all, gap_m = |dist_m - at_dist_m| (0.0 with no match), and ahead whether it is in
+  front of the car. k == 0.0 with n_ok == 0 means UNMEASURABLE, not straight — same contract as the
+  sibling.
+
+  WHY THIS EXISTS (icbmconsist2pnw, 2026-09-08). A consistency check between mapd's claimed curve
+  speed and the polyline needs the curvature AT MAPD'S OWN POINT. Using the horizon maximum instead
+  compares two different places on the road, and a review of exactly that mistake found the gap
+  between them was 51–328 m on all 28 ticks it fired on in a real drive — never below 50 m — and that
+  on one tick it contradicted a CORRECT mapd claim (a ramp at R≈38 m, 22 m ahead) using an unrelated
+  gentler curve 172 m further on, which would have suppressed a real slowdown.
+
+  `gap_m` is the whole point: it is the caller's evidence that a comparison is legitimate at all. A
+  large gap means the polyline has nothing to say about mapd's point, and the honest response is to
+  abstain rather than to contradict it with a different curve.
+
+  Pure; never raises. Deliberately a SEPARATE function rather than a parameter on
+  polyline_curvature(): that one is on the live VTSC control path for the Tesla, and this is a
+  telemetry-first measurement that must not be able to perturb it."""
+  try:
+    if not points or cur_lat is None or cur_lon is None:
+      return 0.0, 0.0, 0, 0.0, True
+    at = float(at_dist_m)
+    if not math.isfinite(at):
+      return 0.0, 0.0, 0, 0.0, True
+    pts = []
+    for p in points[:_K_MAX_POINTS]:
+      try:
+        la, lo = float(p["latitude"]), float(p["longitude"])
+      except (KeyError, TypeError, ValueError):
+        continue
+      if not (math.isfinite(la) and math.isfinite(lo)):
+        continue
+      d = _haversine_m(cur_lat, cur_lon, la, lo)
+      if 0.0 <= d <= horizon_m:
+        pts.append((d, la, lo))                        # order preserved -- see the sibling's note
+    if len(pts) < 3:
+      return 0.0, 0.0, 0, 0.0, True
+    legs = [_haversine_m(pts[i][1], pts[i][2], pts[i+1][1], pts[i+1][2]) for i in range(len(pts)-1)]
+    best_k, best_d, best_gap, best_ahead, n_ok, found = 0.0, 0.0, 0.0, True, 0, False
+    for i in range(1, len(pts) - 1):
+      ab, bc = legs[i-1], legs[i]
+      if not (_K_MIN_LEG_M <= ab <= _K_MAX_LEG_M and _K_MIN_LEG_M <= bc <= _K_MAX_LEG_M):
+        continue
+      (_, la0, lo0), (db, la1, lo1), (_, la2, lo2) = pts[i-1], pts[i], pts[i+1]
+      n_ok += 1                                        # count the SPACING gate, before collinearity
+      gap = abs(db - at)
+      if found and gap >= best_gap:
+        continue                                       # a nearer triplet to mapd's point already won
+      ca = _haversine_m(la0, lo0, la2, lo2)
+      k = 0.0
+      if ab * bc * ca > 0.0:
+        cosb = math.cos(math.radians(la1))
+        ax, ay = (lo0 - lo1) * 111320.0 * cosb, (la0 - la1) * 111320.0
+        cx, cy = (lo2 - lo1) * 111320.0 * cosb, (la2 - la1) * 111320.0
+        area2 = abs(ax * cy - ay * cx)
+        if area2 > 0.0:
+          k = 2.0 * area2 / (ab * bc * ca)             # Menger curvature, same as the sibling
+      # A collinear (k == 0) triplet is a LEGITIMATE match: "the road is straight at mapd's point" is
+      # exactly the reading a consistency check needs. n_ok tells the caller it was measurable.
+      ahead = True
+      if cur_bearing is not None:
+        try:
+          ahead = _rel_bearing_deg(cur_lat, cur_lon, la1, lo1, float(cur_bearing)) <= 90.0
+        except (TypeError, ValueError):
+          ahead = True
+      best_k, best_d, best_gap, best_ahead, found = k, db, gap, ahead, True
+    if not found:
+      return 0.0, 0.0, n_ok, 0.0, True
+    return best_k, best_d, n_ok, best_gap, best_ahead
+  except Exception:
+    return 0.0, 0.0, 0, 0.0, True
+
+
 def most_binding_map_curve(points, cur_lat, cur_lon, v_ego: float, horizon_m: float,
                            a_decel: float = C.A_DECEL, finish_s: float = C.APEX_FINISH_S,
                            sharp_v: float = C.SHARP_CURVE_V, speed_scale: float = 1.0,

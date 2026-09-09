@@ -144,7 +144,11 @@ def _rig(tmp_path, monkeypatch):
   g._icbm_k = 0.0              # icbmconsist2pnw
   g._icbm_k_n = 0              # icbmconsist2pnw
   g._icbm_k_ahead = False      # icbmconsist2pnw
-  g._icbm_consist_hit = False  # icbmconsist2pnw
+  g._cur_bearing = None     # icbmconsist2pnw: the point-match reads it
+  g._icbm_k_at = 0.0        # icbmconsist2pnw (point-matched, telemetry only)
+  g._icbm_k_at_d = 0.0      # icbmconsist2pnw
+  g._icbm_k_at_n = 0        # icbmconsist2pnw
+  g._icbm_k_at_gap = 0.0    # icbmconsist2pnw
   g._icbm_gate = None
   g._icbm_map_reach = None
   g._stock_set = 0.0
