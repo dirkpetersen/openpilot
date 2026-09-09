@@ -170,3 +170,50 @@ class TestForensics:
     rels = [r.get("rel") for r in recs[-1]["reports"]]
     assert all(x is not None for x in rels), "every report needs its relative bearing logged"
     assert max(rels) > 90.0, "the report behind us must be visible as such in the log"
+
+
+class TestGeminiReviewFindings:
+  """Defects found by the Gemini review of the first cut of this change (2026-09-08)."""
+
+  def test_a_nan_coordinate_cannot_swallow_every_valid_report(self):
+    """REAL REGRESSION vs the shipped code. json.loads accepts a bare NaN literal and float("nan")
+    does not raise, so a bad proxy coordinate reaches _select as NaN. Every NaN comparison is False,
+    so the range and hemisphere tests do NOT reject it, and min() returns it when it sorts first --
+    silently discarding every valid report. The old code skipped it only incidentally (its
+    `NaN < best_along` is also False)."""
+    nan_alert = {"lat": float("nan"), "lon": -122.0, "magvar": None, "uuid": "nan1", "street": "",
+                 "town": "T", "thumbs": 0, "ts": (_now_epoch() - 300.0) * 1000.0}
+    out = _line([nan_alert, _alert("good", 3.0)])          # NaN FIRST -- the poisoning order
+    assert out["state"] == "alert", "a NaN report must not suppress the overlay"
+    assert out["dist_mi"] == pytest.approx(3.0, abs=0.2)
+    assert out["dist_mi"] == out["dist_mi"], "published distance must never be NaN"
+
+  def test_a_nan_only_feed_yields_no_alert_not_a_nan_distance(self):
+    nan_alert = {"lat": float("nan"), "lon": float("nan"), "magvar": None, "uuid": "nan2",
+                 "street": "", "town": "T", "thumbs": 0, "ts": (_now_epoch() - 300.0) * 1000.0}
+    out = _line([nan_alert])
+    assert out["state"] != "alert"
+
+  def test_ranking_uses_unrounded_distance(self):
+    """recede.live_mi rounds to 0.1 mi, so ranking on it makes 4.04 and 3.96 tie at 4.0 and the pick
+    flip as they separate. Ordering must use the raw distance."""
+    a = _alert("aaa", 4.04)      # sorts FIRST on uuid, so a rounded tie would pick it
+    b = _alert("bbb", 3.96)
+    out = _line([a, b])
+    assert out["dist_mi"] == pytest.approx(4.0, abs=0.05)
+    # the published value is rounded, so assert identity instead: the nearer report must win
+    import openpilot.system.location_services.location_servicesd as _l
+    recede = _l._PoliceRecede(_l.POLICE_RECEDE_MI)
+    line = _l._line_police([a, b], "ok", "", 47.0, -122.0, 0.0, [], recede)
+    assert line["uuid"] == "bbb", "the genuinely nearer report must win, not the uuid tie-break"
+
+  def test_cap_carries_last_seen_min(self):
+    """The banner renders {**p, **cap}; a field on the display line but missing from cap is
+    inherited from the OTHER report -- the splice a previous review round fixed for dir/town."""
+    now = _now_epoch()
+    confirmed = _alert("conf", 0.4, age_min=1, thumbs=9)
+    merged, _ = merge_retained_police({}, [confirmed], now)
+    out = _line(merged)
+    assert out.get("cap") is not None
+    assert "last_seen_min" in out["cap"], "cap must carry last_seen_min or the banner splices"
+    assert out["cap"]["last_seen_min"] == 0

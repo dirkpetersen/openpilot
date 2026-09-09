@@ -1116,20 +1116,33 @@ def _line_police(alerts, state, err, lat, lon, brg, path, recede):
   def _select(cands):
     ranked = []
     for al in cands:
-      d = recede.live_mi(al, lat, lon)
-      if d is None or d > DISPLAY_MAX_MI:
+      # Rank on the UNROUNDED distance. recede.live_mi() rounds to 0.1 mi, which creates ties: two
+      # reports at 4.04 and 3.96 mi both read 4.0, the tie-break picks one, and 0.02 mi later they
+      # separate and it flips (Gemini review). live_mi stays the PUBLISHED value; ordering uses this.
+      # NaN-safe by construction (Gemini review, a real regression vs the old code): json.loads
+      # accepts a bare `NaN` literal and float("nan") does not raise, so a bad coordinate from the
+      # proxy yields NaN here. Every NaN comparison is False, so `d > DISPLAY_MAX_MI` would NOT
+      # reject it, and min() would then return it if it sorted first -- silently discarding every
+      # valid report and publishing a NaN dist_mi that the UI's `bd <= _POLICE_NEAR_MI` test
+      # suppresses. The old code survived this only incidentally (nearest_ahead's `NaN < best_along`
+      # is also False, so it skipped instead of selecting). `d == d` is the NaN test.
+      try:
+        d = geo.haversine_m(lat, lon, float(al["lat"]), float(al["lon"])) / geo.M_PER_MILE
+      except (KeyError, TypeError, ValueError):
+        continue
+      if not (d == d) or d > DISPLAY_MAX_MI:
         continue
       if brg is not None:
         try:
           rel = abs(geo.normalize180(geo.bearing_deg(lat, lon, float(al["lat"]), float(al["lon"])) - brg))
         except (KeyError, TypeError, ValueError):
           continue
-        if rel > POLICE_NEAR_CONE_DEG:
-          continue                                # behind us — leave it to recede-tracking to retire
+        if not (rel == rel) or rel > POLICE_NEAR_CONE_DEG:
+          continue                                # behind us (or unusable) — recede-tracking retires it
       ranked.append((d, al))
     if not ranked:
       return None, None
-    # tie-break on uuid so equal distances cannot flap tick-to-tick (and so the key never compares dicts)
+    # tie-break on uuid so exactly-equal distances cannot flap (and so the key never compares dicts)
     return min(ranked, key=lambda t: (t[0], (t[1].get("uuid") or "")))[1], None
 
   # policetier2pnw -- DISPLAY and CONTROL are separate channels (two Gemini review rounds).
@@ -1196,6 +1209,14 @@ def _line_police(alerts, state, err, lat, lon, brg, path, recede):
       # the (proximity-picked, possibly different) display line spliced two reports into one message.
       out["cap"] = {"dist_mi": cap_mi, "uuid": cap_poi.get("uuid"), "key": cap_key,
                     "age_min": _age_min(cap_poi.get("ts"), now),
+                    # policelastseen2pnw: `last_seen_min` MUST be carried here too. The banner renders
+                    # `{**p, **cap}` (location_services_status.py ~:288), so a field present on the
+                    # display line but absent from `cap` is inherited from the OTHER report -- the
+                    # exact splice a previous review round fixed for dir/town. It is not visible today
+                    # (the banner draws only dist_mi), but leaving the hole re-arms that trap for
+                    # whoever renders age next. Gemini review 2026-09-08.
+                    "last_seen_min": (None if cap_poi.get("last_seen") is None
+                                      else max(0, int((now - float(cap_poi["last_seen"])) // 60))),
                     "dir": _police_dir(cap_poi, brg), "town": cap_poi.get("town", "")}
   return out
 
