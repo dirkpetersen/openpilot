@@ -7,7 +7,7 @@ from pathlib import Path
 from openpilot.system.hardware.hw import Paths
 
 from openpilot.common.swaglog import cloudlog
-from openpilot.system.loggerd.uploader import (main, pass1_allowed, pass2_allowed, PASS2_NETWORK_TYPES,
+from openpilot.system.loggerd.uploader import (main, effective_metered, pass1_allowed, pass2_allowed, PASS2_NETWORK_TYPES,
                                                UPLOAD_ATTR_NAME, UPLOAD_ATTR_VALUE, Uploader,
                                                uploadable_firehose_files, FIREHOSE_FILES)
 from cereal import log
@@ -25,18 +25,20 @@ class TestUploadGate:
   GPS preferred location or (2) on unmetered wifi -- car running or not should not play a role."
   So pass 2 needs WiFi AND (at_home OR not metered). `onroad`/`parked` are NO LONGER consulted.
 
-  Pass 1 is unchanged: metered blocks it, unmetered (WiFi or LTE) allows it.
+  Pass 1 was left on the OLD spec here (metered blocks it unconditionally) and was brought onto
+  the same two qualifiers by uploadgate3pnw -- see TestUploadGate3Pnw at the bottom of this file.
+  The two pass-1 cases below still hold because they pin at_home=False.
 
   The three assertions below that reversed (drive-away, unmetered-not-home, metered-at-home) were
   the OLD spec and are deliberately kept as reversed cases rather than deleted, so the change of
   contract is visible in the diff instead of silently disappearing."""
 
-  # -- pass 1: metered blocks everything; unmetered (wifi or LTE) flows --
+  # -- pass 1, NOT at home: metered blocks everything; unmetered (wifi or LTE) flows --
   def test_pass1_metered_blocks(self):
-    assert not pass1_allowed(metered=True)
+    assert not pass1_allowed(WIFI, metered=True, at_home=False)
 
   def test_pass1_unmetered_allows(self):
-    assert pass1_allowed(metered=False)
+    assert pass1_allowed(WIFI, metered=False, at_home=False)
 
   # -- pass 2: home-first --
   def test_pass2_home_offroad_allows(self):
@@ -497,3 +499,79 @@ class TestSkipWideFullLoop(UploaderTestCase):
     assert pass2, "no pass-2 uploads happened at all"
     assert pass2[0].endswith(("rlog.zst", "rlog")), \
       f"pass 2 did not start with rlog (got {pass2[0]}) -- priority ordering regressed"
+
+
+class TestUploadGate3Pnw:
+  """uploadgate3pnw — the two passes must agree about what a connection costs.
+
+  MEASURED ON THE TRUCK 2026-09-10, SSID "KarlMoik" (mobile Starlink, NM connection.metered = yes,
+  and at the time also a configured priority network so OnPriorityNetwork = 1):
+
+      pass1_allowed(metered=True)                 -> False    1 MB qlogs BLOCKED
+      pass2_allowed(metered=True, at_home=True)   -> True     75 MB HD video ALLOWED
+
+  2,642 MB had gone out over that metered link since boot. The device refused the small files while
+  sending the large ones over the same connection. The cause was two specs coexisting: pass 2 was
+  updated 2026-09-05 to "priority network OR unmetered", pass 1 was left on the older
+  "metered -> nothing" rule.
+  """
+
+  def test_the_two_gates_agree_on_a_metered_priority_network(self):
+    """THE BUG. Same connection, opposite answers, and the expensive one won."""
+    assert pass1_allowed(WIFI, metered=True, at_home=True) is True
+    assert pass2_allowed(WIFI, True, True, False, True, False) is True
+
+  def test_a_metered_NON_priority_network_still_blocks_BOTH(self):
+    """The protection that must NOT be lost: the driver's Starlink is metered and is no longer a
+    priority network, so nothing should upload there."""
+    assert pass1_allowed(WIFI, metered=True, at_home=False) is False
+    assert pass2_allowed(WIFI, True, False, False, True, False) is False
+
+  def test_unmetered_is_unchanged_on_every_network_type(self):
+    """Unmetered LTE keeps uploading small files -- that is the 2026-07-13 spec and this change must
+    not narrow it."""
+    for network_type in (WIFI, CELL):
+      for at_home in (True, False):
+        assert pass1_allowed(network_type, metered=False, at_home=at_home) is True
+
+  def test_at_home_does_NOT_open_the_modem(self):
+    """THE HOLE THE FIRST CUT OF THIS CHANGE HAD (found by review before it shipped).
+
+    OnPriorityNetwork means "the WLAN interface is associated with a configured priority SSID". It
+    does NOT mean that SSID is carrying our traffic. When priority WiFi is associated but has no
+    working uplink -- obstructed Starlink, unaccepted captive portal, dead router -- NM demotes it,
+    the default route moves to the modem, and deviceState reports networkType=cell while
+    OnPriorityNetwork is still 1. The LTE device on the 3X reports GENERAL.METERED "yes (guessed)".
+    So this exact triple is reachable, and it must NOT upload."""
+    assert pass1_allowed(CELL, metered=True, at_home=True) is False
+    assert pass2_allowed(CELL, True, True, False, True, False) is False
+
+  def test_the_throttle_inside_step_agrees_with_the_gate(self):
+    """Fable review: the gate is not the only thing that reads `metered`. list_upload_files() drops
+    qcamera.ts and any crash//boot/ log younger than 12 h on a `metered` listing. Passing the RAW bit
+    there while the gate used the relaxed one meant pass 2 shipped 75 MB of video on a metered
+    priority network while pass 1 quietly withheld the 1 MB qcam -- no log line, sidebar green.
+    One notion of cost, or the drift this commit removes comes straight back one layer down."""
+    assert effective_metered(WIFI, metered=True, at_home=True) is False    # priority wifi: not costly
+    assert effective_metered(WIFI, metered=True, at_home=False) is True    # someone else's metered wifi
+    assert effective_metered(CELL, metered=True, at_home=True) is True     # the modem is ALWAYS costly
+    assert effective_metered(CELL, metered=False, at_home=False) is False  # unmetered LTE: unchanged
+    # and the gate is exactly its negation -- they cannot drift
+    for network_type in (WIFI, CELL):
+      for metered in (True, False):
+        for at_home in (True, False):
+          assert pass1_allowed(network_type, metered, at_home) is not effective_metered(network_type, metered, at_home)
+
+  def test_small_files_are_never_blocked_where_big_ones_are_allowed(self):
+    """The invariant, stated directly: there must be NO connection on which pass 2 runs and pass 1
+    does not. Exhaustive over every axis either gate reads, network type included."""
+    for network_type in (WIFI, CELL):
+      for metered in (True, False):
+        for at_home in (True, False):
+          for onroad in (True, False):
+            for parked in (True, False):
+              for defer_hd in (True, False):
+                p2 = pass2_allowed(network_type, metered, at_home, onroad, parked, defer_hd)
+                p1 = pass1_allowed(network_type, metered, at_home)
+                assert not (p2 and not p1), \
+                  f"pass2 allowed but pass1 blocked: {network_type=} {metered=} {at_home=} {onroad=} {parked=} {defer_hd=}"

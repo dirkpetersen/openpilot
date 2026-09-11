@@ -173,13 +173,67 @@ MAX_UPLOAD_SIZES = {
 }
 
 
-def pass1_allowed(metered: bool) -> bool:
+def effective_metered(network_type: int, metered: bool, at_home: bool) -> bool:
+  """Does this connection cost us money for DRIVE-FILE traffic? The single notion of cost this
+  module decides with -- uploadgate3pnw (2026-09-10).
+
+  NM's `metered` bit is about the LINK. This is about the POLICY: the driver's spec says a
+  configured, GPS-gated priority network is his to use, metered or not ("nothing should be blocked
+  when on a wifi that is (1) either GPS preferred location or (2) unmetered"). So a metered priority
+  WiFi is NOT expensive for our purposes, and everything downstream must agree on that -- the pass-1
+  gate AND the per-file throttle inside list_upload_files, which on a `metered` listing silently
+  drops qcamera.ts and any boot/crash log younger than 12 h.
+
+  That silent drop is why this is a named function and not an expression in the gate (Fable review
+  2026-09-10). The first cut passed the RAW metered bit to step() while the gate used the relaxed
+  one, so on a metered priority network pass 2 shipped 75 MB of video while pass 1 quietly withheld
+  the 1 MB qcam -- no log line, sidebar still green because qlogs moved. That is precisely the
+  "feature that quietly does nothing" Rule 2 bans, and it is the same two-specs-coexisting defect
+  this commit exists to remove, one layer down.
+
+  THE at_home QUALIFIER REQUIRES WIFI, exactly as it does in pass2_allowed. `at_home`
+  (OnPriorityNetwork) means "the WLAN interface is ASSOCIATED with a configured priority SSID" -- not
+  that the SSID is carrying our traffic. NM demotes a WiFi that fails its connectivity check
+  (obstructed Starlink, unaccepted captive portal, dead router) and makes the modem primary while the
+  wlan stays associated, so deviceState reports networkType=cell with OnPriorityNetwork still 1.
+  Probed on the 3X 2026-09-10: the LTE device reports GENERAL.METERED "yes (guessed)". Without the
+  WiFi requirement that state would upload drive files over the modem -- the most expensive link the
+  device has, and the one the cost ladder in system/networkd exists to stay off. The arbiter's
+  change-only write is also only as fresh as its 20 s poll, and it is `always_run` WITHOUT
+  restart_if_crash, so a dead arbiter freezes OnPriorityNetwork at its last value until a manager
+  restart; the WiFi requirement bounds what a frozen True can authorise.
+  """
+  return metered and not (at_home and network_type in PASS2_NETWORK_TYPES)
+
+
+def pass1_allowed(network_type: int, metered: bool, at_home: bool) -> bool:
   # uploadgate2pnw (driver spec 2026-07-13): METERED -> no drive-FILE uploads at all, not even the
   # small pass-1 files (stock uploads them throttled on metered; the driver wants zero metered file
   # traffic). Unmetered (WiFi or LTE) -> pass 1 (qlog/qcam) flows. Location services are NOT gated by
   # this (driver qualification): the CloudWatch device locator gets its own tiny heartbeat below
   # (LOCATOR_PING_S) that runs on ANY connection, so the device stays findable on metered too.
-  return not metered
+  #
+  # uploadgate3pnw (2026-09-10) -- the "metered -> nothing" rule above is now qualified by at_home,
+  # because the two gates disagreed and the disagreement ran the expensive way round. MEASURED ON THE
+  # TRUCK: on SSID "KarlMoik" (a mobile Starlink link, NM connection.metered = yes, and at the time
+  # also a configured priority network so OnPriorityNetwork = 1):
+  #     pass1_allowed(metered=True)                  -> False   1 MB qlogs BLOCKED
+  #     pass2_allowed(metered=True, at_home=True)    -> True    75 MB HD video ALLOWED
+  # 2,642 MB had gone out over that metered link since boot. The device was refusing to send the
+  # small files while sending the large ones over the same connection, which is indefensible under
+  # any reading of either spec.
+  #
+  # The cause was two specs coexisting: pass 2 was updated on 2026-09-05 to "nothing should be
+  # blocked when on a wifi that is (1) either GPS preferred location or (2) unmetered", and pass 1
+  # was left on the older 2026-07-13 rule. Both now decide from effective_metered(), so they cannot
+  # drift apart again: if being on a priority network justifies a 75 MB video burst, it certainly
+  # justifies a 1 MB qlog.
+  #
+  # Note what this does NOT do: it does not open metered NON-priority networks. On the driver's
+  # Starlink (now removed from the priority list, since priority networks are meant to be stationary)
+  # at_home is False and metered is True, so BOTH passes stay blocked -- that link being the
+  # expensive one the cost ladder in system/networkd exists to rank below real WiFi.
+  return not effective_metered(network_type, metered, at_home)
 
 
 # uploadgate2pnw: device-locator heartbeat period. On a connection where file uploads are blocked
@@ -728,11 +782,21 @@ def main(exit_event: threading.Event | None = None) -> None:
     network_type_raw = int(NetworkType.wifi) if force_wifi else sm['deviceState'].networkType.raw
     metered = sm['deviceState'].networkMetered
 
-    # uploadgate2pnw (driver spec): metered -> NO file uploads at all (pass 1 previously ran throttled
-    # on metered; now it needs an unmetered connection — WiFi or LTE both fine).
+    # uploadgate3pnw: pass 1 consults at_home too now, so it needs its OWN read here. Pass 2 keeps a
+    # separate read BELOW, after pass 1 has run -- deliberately, and NOT hoisted up to share this one.
+    # uploader.step() can block for tens of seconds clearing a backlog on a slow link, and the truck
+    # can leave the geofence inside that window; pass 2 is the 75 MB one, so it gets the freshest
+    # answer available. Two Params reads per loop is one file read each. (Gemini wanted the fresh
+    # read; Fable judged a single shared read acceptable but not better. Refreshing only ever moves
+    # pass 2 in the conservative direction, so it is the cheap side to be wrong on.)
+    at_home = params.get_bool("OnPriorityNetwork")
+
+    # ONE notion of cost, used by the gate AND by step()'s per-file throttle -- see effective_metered.
+    cost = effective_metered(network_type_raw, metered, at_home)
+
     p1 = None
-    if pass1_allowed(metered):
-      p1 = uploader.step(network_type_raw, metered)             # pass 1 (small files)
+    if pass1_allowed(network_type_raw, metered, at_home):
+      p1 = uploader.step(network_type_raw, cost)                # pass 1 (small files)
     uploader.set_pass1_active(p1 is True)   # sidebar GREEN while pass-1 progresses (change-only write)
     if p1 is None:
       pass1_run = 0
@@ -745,12 +809,16 @@ def main(exit_event: threading.Event | None = None) -> None:
     # HD-interleave: run pass 2 when pass 1 has nothing left (p1 is None) OR after every
     # PASS2_INTERLEAVE successful small uploads, so HD video makes steady progress instead of being
     # starved behind a long backlog of small files. Small files keep priority.
-    at_home = params.get_bool("OnPriorityNetwork")
+    at_home = params.get_bool("OnPriorityNetwork")   # RE-read: pass 1 above may have taken a while
     parked = params.get_bool("GearPark")
     defer_hd = params.get_bool(DEFER_HD_PARAM)   # uploadgate2pnw2: relaxes the onroad block (rlog-only)
     p2 = None
     if pass2_allowed(network_type_raw, metered, at_home, onroad, parked, defer_hd) and (p1 is None or pass1_run >= PASS2_INTERLEAVE):
-      p2 = uploader.step(network_type_raw, metered, pass2=True)
+      # same `cost` as pass 1: on a qualifying priority network the throttle inside list_upload_files
+      # must not silently withhold files the gate just authorised. (For pass 2 specifically this is a
+      # no-op today -- the throttle only touches qcamera.ts and crash//boot/ folders, none of which
+      # are FIREHOSE_FILES -- but passing the raw bit here would re-create the very drift being fixed.)
+      p2 = uploader.step(network_type_raw, effective_metered(network_type_raw, metered, at_home), pass2=True)
       pass1_run = 0
 
     # backoff from the combined outcome: None=nothing to do anywhere; True=made progress; False=failure
