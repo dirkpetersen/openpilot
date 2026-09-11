@@ -56,6 +56,15 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // network2xnor: perpetual tethering + priority-wifi arbitration (default OFF / blank)
     {"TetheringEnabled", {PERSISTENT, BOOL, "0"}},
     {"TetheringPriorityWifi", {PERSISTENT, STRING, ""}},
+    // netcosttier2pnw: KILL SWITCH for the network cost ladder (tiers 1 and 2 -- other saved wifi in
+    // range, ranked unmetered before unknown before metered). Default 0 = the ladder is ON, which is
+    // the driver's explicit request ("the tethering network should be the lowest priority if another
+    // wifi connection is available because the tethering network is the most expensive network").
+    // INVERTED POLARITY so the key itself still defaults to "0", same idiom as DisableLaneCentering.
+    // Set it to 1 to fall back to the old binary behaviour -- a configured priority network, or our
+    // own hotspot, nothing in between -- without a deploy. A network feature that can hold the radio
+    // needs a revert that works from an SSH session, because the failure mode is losing the network.
+    {"DisableNetworkCostLadder", {PERSISTENT, BOOL, "0"}},
     {"TetheringHomeLocation", {PERSISTENT, STRING}},  // network2xnor: GPS [lat,lon] of the priority WiFi (auto-learned) -> geo-gate scanning (LEGACY single-home; migrated into TetheringPriorityNetworks)
     {"TetheringPriorityNetworks", {PERSISTENT, STRING}},  // network2xnor: JSON list of {label,ssid,lat,lon,portal} priority WiFi networks (multi-location + captive-portal)
     {"HardwareSerial", {PERSISTENT, STRING}},

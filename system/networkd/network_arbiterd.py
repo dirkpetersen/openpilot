@@ -44,7 +44,10 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.system.networkd.network_arbiter import (
   HOTSPOT_CONNECTION_ID,
   decide,
+  judge_link,
+  pending_for_new_link,
   priority_connection_id,
+  ssid_of,
 )
 from openpilot.system.networkd.lte_guard import decide_lte_guard
 from openpilot.system.networkd.geo_gate import near_any_home, haversine_m
@@ -131,11 +134,15 @@ def _wifi_autoconnect_repair(nets: list[dict]) -> None:
       _nmcli(["con", "modify", name, "connection.autoconnect-priority", str(target)])
 
 
-def _scan_ssids() -> list[str]:
-  """SSIDs currently visible to NM. `nmcli -t -f SSID dev wifi list` (works even in AP mode)."""
+def _scan_ssids() -> list[str] | None:
+  """SSIDs currently visible to NM, or None if the scan COULD NOT BE TAKEN.
+
+  netcosttier2pnw: None and [] are different facts. [] means "we looked and saw nothing"; None means
+  nmcli failed and we know nothing. The ledger's reappearance logic must not read a failed scan as
+  "every network went out of range" -- see _forget_on_reappearance."""
   out = _nmcli(["-t", "-f", "SSID", "dev", "wifi", "list"])
   if out is None:
-    return []
+    return None
   return [line for line in (raw.strip() for raw in out.splitlines()) if line]
 
 
@@ -145,6 +152,198 @@ def _saved_connections() -> list[str]:
   if out is None:
     return []
   return [line for line in (raw.strip() for raw in out.splitlines()) if line]
+
+
+_metered_cache: dict[str, str] = {}   # ssid -> last SUCCESSFULLY read connection.metered value
+
+
+def _metered_states(saved: list[str], of_interest: set[str]) -> tuple[set[str], set[str]]:
+  """(metered, unmetered) SSIDs, from NM's `connection.metered` on each saved client profile.
+
+  netcosttier2pnw. Returns TWO sets because the field has THREE states and the third is not a
+  synonym for either:
+
+      yes      -> in `metered`     asserted expensive
+      no       -> in `unmetered`   asserted cheap
+      unknown  -> in NEITHER       nobody ever said -- ranked between them by choose_wifi
+
+  Measured on the 3X 2026-09-10: of four saved client profiles only the iPhone and the home WiFi
+  carry an explicit `no`; the driver's mobile Starlink and "Visitor" are both `unknown`. Collapsing
+  unknown into `no` (the first cut of this file) put the Starlink level with the unmetered iPhone and
+  left an alphabetical tiebreak to decide -- see choose_wifi for why that is a Rule 2 failure.
+
+  `of_interest` bounds the work to SSIDs that could actually be chosen this tick (in the scan, or the
+  one we are on). Without it this walked every saved profile ever created, one nmcli each, every 20 s
+  forever. nmcli has no way to dump connection.metered for all profiles in a single call -- the
+  field only appears in a per-connection `con show` -- so the fix is to ask about fewer of them, not
+  to ask once.
+
+  An nmcli failure puts the profile in NEITHER set, i.e. it is treated as `unknown`, and it is
+  LOGGED. That is the honest reading: a read that failed tells us nothing, and must not be recorded
+  as an assertion in either direction."""
+  metered: set[str] = set()
+  unmetered: set[str] = set()
+  want = {s.lower() for s in of_interest}
+  for conn in saved:
+    ssid = ssid_of(conn)
+    if not ssid or ssid.lower() not in want:
+      continue
+    raw = _nmcli(["-t", "-f", "connection.metered", "con", "show", conn])
+    if raw is None:
+      # NO NEW INFORMATION -- reuse the last value we successfully read, if any. Dropping to
+      # "unknown" here was a real defect (Gemini review 2026-09-11): a metered PRIORITY network is
+      # demoted out of tier 0 only while we can see that it is metered, so one timed-out nmcli call
+      # promoted it straight back to tier 0, tore down the cheaper link the ladder had chosen, and
+      # the next successful read demoted it again -- a flap driven purely by nmcli flakiness.
+      cached = _metered_cache.get(ssid)
+      if cached == "yes":
+        metered.add(ssid)
+      elif cached == "no":
+        unmetered.add(ssid)
+      cloudlog.warning(f"network_arbiterd: could not read connection.metered for {conn!r} -- reusing last known value {cached!r}")
+      continue
+    val = raw.strip().lower().rsplit(":", 1)[-1]
+    _metered_cache[ssid] = val
+    if val == "yes":
+      metered.add(ssid)
+    elif val == "no":
+      unmetered.add(ssid)
+    # anything else (notably "unknown") deliberately lands in neither set
+  return metered, unmetered
+
+
+# --- netcosttier2pnw: association-failure ledger -----------------------------------------------
+# Bringing a client network up DROPS THE HOTSPOT FIRST. If the association then fails -- AP in range
+# but refusing, wrong PSK, DHCP dead -- the device is left with no uplink at all, and next tick it
+# picks the same network again (still in the scan) and repeats. That is an indefinite offline loop,
+# and it is newly reachable because the cost ladder makes EVERY saved network a candidate, where
+# before only a geo-gated priority network was. So a network that will not come up has to earn its
+# way out of the running for a while.
+_WLAN_DEV = "wlan0"
+
+DHCP_GRACE_S = 60.0   # NM's DHCP timeout is 45 s and the poll is 20 s, so the first look at a link
+                      # we just raised can legitimately land mid-activation. Judging it there was
+                      # measured to tear down links that would have completed seconds later.
+_usable_cache: dict[str, bool] = {}   # ssid -> last SUCCESSFULLY determined link usability
+
+FAIL_BACKOFF_S = (60.0, 300.0, 900.0)   # escalating, then held at the last value (15 min cap)
+# The cap is deliberately NOT an hour. The costs are asymmetric: retrying a genuinely dead network
+# costs one hotspot blip every 15 min (we detect the failure and go back within one 20 s tick),
+# while exiling a network that has come back costs the driver an hour of LTE in his own driveway.
+# A rebooting router is also handled directly -- see _forget_on_reappearance.
+
+
+def _client_link_usable(conn_id: str, has_portal_handler: bool = False) -> bool | None:
+  """TRI-STATE. True = has an IPv4 address, False = associated with none, None = COULD NOT TELL.
+
+  NetworkManager reports a wifi 'activated' as soon as it associates, so association alone is worth
+  nothing: a dead DHCP server, or an AP that accepts the association and routes nowhere, looks
+  connected forever. An IPv4 address is the cheapest honest evidence that the link is carrying
+  anything.
+
+  The None case is not pedantry. An earlier cut returned a plain bool and folded an nmcli timeout
+  into False, so one flaky call recorded a failure against a working link, un-stuck it, and -- with
+  the scan empty under the geo-gate -- handed the radio to the hotspot on the next tick. A test of
+  mine asserted that folding as correct. It is the parent CLAUDE.md's "an ERROR is not a NEGATIVE
+  RESULT" rule, which this file had already been bitten by once."""
+  out = _nmcli(["-t", "-f", "IP4.ADDRESS", "con", "show", conn_id])
+  if out is None:
+    cloudlog.warning(f"network_arbiterd: could not read IP4.ADDRESS for {conn_id!r} -- link state UNKNOWN this tick, not assumed dead")
+    return None
+  if not any(line.split(":", 1)[-1].strip() for line in out.splitlines() if line.strip()):
+    return False
+
+  # An address is necessary but not sufficient. A saved cafe network whose portal we never accepted,
+  # a home router whose ISP is down, an obstructed Starlink: all hold an IPv4 address and would pass
+  # the check above, hold the radio, and BLACK-HOLE THE DEVICE'S OWN TRAFFIC -- measured on the 3X,
+  # wlan0's default route has metric 600 against wwan0's 1000, so WiFi wins even when it goes
+  # nowhere. NM's own connectivity check is enabled here (verified: `nmcli -t -f CONNECTIVITY
+  # general` -> full) and reports per-device, which is what we need: the global value is masked by
+  # LTE still working.
+  #
+  # `none` and `limited` are always dead. `portal` is usable ONLY when this SSID actually has an
+  # accept handler configured -- that is the case the exemption exists for, because the auto-accept
+  # path has to be ON the network to POST the form, and demoting `portal` there would tear the link
+  # down before the handler could ever run.
+  #
+  # For any OTHER portal network the exemption is a black hole (Fable): a hotel WiFi joined once,
+  # still saved, is now a ladder candidate. Measured -- the device parked on it sticky and "usable",
+  # hotspot down, wlan0 holding the default route at metric 600, indefinitely, with no log line at
+  # all. That is precisely the failure this connectivity check was added to close, re-opened by its
+  # own exemption. An unreadable value is UNKNOWN, not dead.
+  conn = _nmcli(["-g", "GENERAL.IP4-CONNECTIVITY", "dev", "show", _WLAN_DEV])
+  if conn is None:
+    return None
+  state = conn.strip().lower()
+  dead = state.startswith(("1 ", "2 ", "none", "limited")) or state in ("1", "2")
+  portal = state.startswith("3 ") or state == "portal"
+  if dead or (portal and not has_portal_handler):
+    cloudlog.event("netcosttier_link_no_upstream", conn_id=conn_id, ip4_connectivity=conn.strip(),
+                   portal_handler=has_portal_handler)
+    return False
+  return True
+
+
+ABSENT_SCANS_FOR_FRESH_START = 2
+
+
+def _forget_on_reappearance(ledger: dict[str, tuple[int, float]], absent: dict[str, int],
+                            scan: set[str] | None) -> None:
+  """Clear the ledger for an SSID that has been genuinely out of range and has come back.
+
+  A backoff is a statement about a network that FAILED while reachable. An SSID that vanished and
+  returned is new information -- most often a router that was rebooting, which is what an escalating
+  backoff punishes hardest (radio up before DHCP, fail, 60 s, fail, 5 min, and the car sits in the
+  driveway on LTE long after the router is healthy).
+
+  TWO GUARDS, both from measured failures of the first version:
+    * `scan is None` means NO SCAN RAN this tick -- the geo-gate suppresses scanning whenever we are
+      already on client WiFi away from a learned location, which is normal operation, not absence.
+      Treating a suppressed scan as "the network is gone" wiped the ledger every other tick and
+      collapsed the whole backoff to the scan-flicker rate: measured 3 clears in 7 ticks, with
+      `consecutive_failures` never getting past 1 and the hotspot dropping every other tick.
+    * a single missing scan result is not absence either -- APs drop out of one scan routinely -- so
+      an SSID must be missing from ABSENT_SCANS_FOR_FRESH_START consecutive REAL scans before its
+      return counts as news."""
+  if scan is None:
+    return                                   # no evidence either way; leave every counter alone
+  for ssid in list(absent):
+    if ssid in scan:
+      if absent.get(ssid, 0) >= ABSENT_SCANS_FOR_FRESH_START and ssid in ledger:
+        cloudlog.event("netcosttier_ledger_cleared", ssid=ssid,
+                       reason=f"back in range after {absent[ssid]} scans absent")
+        ledger.pop(ssid, None)
+      absent[ssid] = 0
+    else:
+      absent[ssid] = absent.get(ssid, 0) + 1
+  for ssid in ledger:
+    absent.setdefault(ssid, 0 if ssid in scan else 1)
+
+
+def _note_attempt(ledger: dict[str, tuple[int, float]], ssid: str, ok: bool, now: float) -> None:
+  """Update the per-SSID failure ledger. Rule 2: every transition is logged as a cloudlog EVENT, not
+  a debug line -- a network quietly dropping out of the ladder is exactly the kind of silence that
+  gets trusted."""
+  ssid = ssid.lower()   # the SAME network reaches here as the configured case ("visitor") from a
+                        # tier-0 pending target and as the AP's case ("Visitor") from ssid_of() --
+                        # keyed literally, one network held TWO ledger entries and a success on one
+                        # never cleared the other (Fable). One key per network.
+  fails, _until = ledger.get(ssid, (0, 0.0))
+  if ok:
+    if fails:
+      cloudlog.event("netcosttier_recovered", ssid=ssid, after_failures=fails)
+    ledger.pop(ssid, None)
+    return
+  fails += 1
+  backoff = FAIL_BACKOFF_S[min(fails, len(FAIL_BACKOFF_S)) - 1]
+  ledger[ssid] = (fails, now + backoff)
+  cloudlog.event("netcosttier_assoc_failed", ssid=ssid, consecutive_failures=fails,
+                 backoff_s=backoff, error="con up did not yield an active wifi with an IPv4 address")
+
+
+def _blocked(ledger: dict[str, tuple[int, float]], now: float) -> set[str]:
+  """Lowercase SSIDs currently serving a backoff. choose_wifi folds case on its side too."""
+  return {ssid for ssid, (_f, until) in ledger.items() if until > now}
 
 
 def _active_wifi_connection() -> str | None:
@@ -185,14 +384,20 @@ def _set_hotspot_nat(enabled: bool) -> None:
       _run([*base, "-I", chain, *rest])
 
 
-def _apply(action: str, priority_ssid: str) -> None:
+def _apply(action: str, ssid: str) -> None:
   """Run the one action chosen by decide(). All failures are logged, never raised."""
   if action == "noop":
     return
   if action == "up_priority":
-    conn_id = priority_connection_id(priority_ssid.strip())
-    cloudlog.info(f"network_arbiterd: priority wifi '{priority_ssid}' in range -> {conn_id} (dropping hotspot)")
+    conn_id = priority_connection_id(ssid.strip())
+    cloudlog.info(f"network_arbiterd: priority wifi '{ssid}' in range -> {conn_id} (dropping hotspot)")
     _set_hotspot_nat(False)                       # hotspot going away -> tear down its NAT
+    _nmcli(["con", "up", conn_id])
+  elif action == "up_fallback":
+    # netcosttier2pnw: tier 1/2 -- some other saved wifi, cheaper than our own LTE.
+    conn_id = priority_connection_id(ssid.strip())
+    cloudlog.info(f"network_arbiterd: no priority network in range; falling back to saved wifi '{ssid}' -> {conn_id} (cheaper than our own LTE)")
+    _set_hotspot_nat(False)
     _nmcli(["con", "up", conn_id])
   elif action == "up_hotspot":
     cloudlog.info("network_arbiterd: bringing hotspot up (+NAT)")
@@ -419,10 +624,17 @@ def main() -> NoReturn:
   portal_result: dict[str, bool] = {}  # ssid -> last accept() online result (set by the worker thread)
   portal_thread: threading.Thread | None = None  # captive-portal accept() runs here so it NEVER blocks this loop
   prev_on_priority: bool | None = None  # firehose2pnw: change-only publish of OnPriorityNetwork (flash-wear guard)
+  assoc_fail: dict[str, tuple[int, float]] = {}  # netcosttier2pnw: ssid -> (consecutive failures, blocked-until)
+  pending_up: tuple[str, float] | None = None   # netcosttier2pnw: (ssid, raised_at) awaiting judgement
+  absent_scans: dict[str, int] = {}             # netcosttier2pnw: ssid -> consecutive REAL scans missing it
+  prev_active_ssid = ""                          # netcosttier2pnw: to spot a link appearing that we did not raise
+
 
   while True:
     try:
       tethering_enabled = params.get_bool("TetheringEnabled")
+      # netcosttier2pnw: re-read every tick so the kill switch takes effect without a restart.
+      fallback_enabled = not params.get_bool("DisableNetworkCostLadder")
       # network2xnor (multi-location): the list param is authoritative; fall back to the legacy single
       # params so existing setups keep working (parse() migrates them transparently).
       nets = pn.parse(params.get("TetheringPriorityNetworks"),
@@ -461,7 +673,14 @@ def main() -> NoReturn:
       # already on a real client network; otherwise finding WiFi wins.
       on_client_wifi = current_active is not None and current_active != HOTSPOT_CONNECTION_ID
       allow_scan = (not on_client_wifi) or near_any_home(pn.locations(nets), gps)
-      scan = _scan_ssids() if (tethering_enabled and net_ssids and allow_scan) else []
+      # netcosttier2pnw: `net_ssids` alone is no longer the right precondition. That gate exists so
+      # we do not burn the single radio scanning for nothing -- but with the cost ladder on there IS
+      # something to look for even when the driver has configured no priority networks at all: every
+      # other saved client profile is a candidate. Left as-is, removing the last priority entry
+      # silently disabled the whole ladder (no scan -> no candidates -> straight to the hotspot),
+      # with nothing to indicate why.
+      scan_raw = _scan_ssids() if (tethering_enabled and (net_ssids or fallback_enabled) and allow_scan) else None
+      scan = scan_raw if scan_raw is not None else []
 
       # STICKY ACTIVE CONNECTION: if we're ALREADY connected to one of our priority SSIDs, keep it —
       # do NOT require it to re-appear in this tick's scan. Otherwise, when the geo-gate pauses
@@ -488,21 +707,91 @@ def main() -> NoReturn:
         prev_on_priority = on_priority
 
       # pick the first configured network that is both in range and has a saved NM connection.
-      chosen = pn.select_available(nets, scan, _saved_connections(), priority_connection_id)
+      saved = _saved_connections()      # netcosttier2pnw: ONE read per tick, shared below
+      chosen = pn.select_available(nets, scan, saved, priority_connection_id)
       chosen_ssid = chosen["ssid"] if chosen else ""
 
       # wifirepair2pnw: assert the autoconnect invariant while tethering is off (see the helper).
       if not tethering_enabled and current_active != HOTSPOT_CONNECTION_ID:
         _wifi_autoconnect_repair(nets)
 
-      action = decide(
+      # netcosttier2pnw: the cost ladder. `chosen_ssid` is tier 0 (a configured priority network,
+      # already geo-gated by select_available). decide() ranks everything else -- unmetered (tier 1)
+      # before unknown before metered (tier 2) -- so we only reach our own hotspot/LTE (tier 3) when
+      # nothing cheaper is usable. It returns the SSID it picked, so the bring-up below cannot act on
+      # a different network than the one that was ranked.
+      now = time.monotonic()
+
+      # One pure function decides what the client link's state MEANS -- whether it is sticky, and
+      # what (if anything) goes in the ledger. It is in network_arbiter.judge_link and is tested
+      # directly, because four separate review defects lived in this glue when it was inline:
+      # an outright `con up` failure was never recorded (nothing is active to inspect, so only the
+      # PENDING bring-up can see it); a flaky nmcli read was treated as a dead link and tore a
+      # working one down; a link still doing DHCP was judged before NM's 45 s timeout; and a
+      # network the driver joined by hand got blamed for the one we had raised.
+      raw_active_ssid = ssid_of(current_active or "")
+
+      # A link we did NOT raise still deserves the DHCP grace: the driver joining a network from the
+      # UI, or NM autoconnecting one at boot, is caught mid-activation if the tick lands in that
+      # window. Without this the first look blamed his manual join, un-stuck it and handed the radio
+      # to the hotspot (Fable). Treat a newly-seen active link as a bring-up we are awaiting, judged
+      # by the same three-way split.
+      pending_up = pending_for_new_link(raw_active_ssid, pending_up, prev_active_ssid, now)
+      prev_active_ssid = raw_active_ssid.lower()
+
+      portal_entry = pn.entry_for_ssid(nets, raw_active_ssid) if raw_active_ssid else None
+      usable = _client_link_usable(current_active, bool(portal_entry and portal_entry.get("portal"))) \
+        if raw_active_ssid else None
+      verdict = judge_link(raw_active_ssid, usable, pending_up, now, DHCP_GRACE_S,
+                           last_known_usable=_usable_cache.get(raw_active_ssid.lower()))
+      if usable is not None and raw_active_ssid:
+        _usable_cache[raw_active_ssid.lower()] = usable
+      active_ssid = verdict.sticky_ssid
+      pending_up = verdict.pending
+      if verdict.blame:
+        _note_attempt(assoc_fail, verdict.blame, verdict.blame_ok, now)
+
+      # A network that has been genuinely out of range and has come back gets a clean slate.
+      _forget_on_reappearance(assoc_fail, absent_scans,
+                              None if scan_raw is None else {s.lower() for s in scan_raw})
+      blocked = _blocked(assoc_fail, now)
+      # cost is only needed when the ladder can actually run, and only for networks that could be
+      # chosen this tick -- one nmcli per candidate, not per saved profile ever created.
+      metered_ssids: set[str] = set()
+      unmetered_ssids: set[str] = set()
+      if tethering_enabled and fallback_enabled:
+        of_interest = set(scan) | ({raw_active_ssid} if raw_active_ssid else set())
+        metered_ssids, unmetered_ssids = _metered_states(saved, of_interest)
+
+      action, target_ssid = decide(
         tethering_enabled=tethering_enabled,
         priority_ssid=chosen_ssid,
         scan_ssids=scan,
-        saved_connections=_saved_connections(),
+        saved_connections=saved,
         current_active=current_active,
+        metered_ssids=metered_ssids,
+        fallback_enabled=fallback_enabled,
+        blocked_ssids=blocked,
+        unmetered_ssids=unmetered_ssids,
+        active_ssid=active_ssid,
       )
-      _apply(action, chosen_ssid)
+      _apply(action, target_ssid)
+      if action in ("up_priority", "up_fallback") and target_ssid:
+        # Remember what we raised. A `con up` that fails outright leaves NOTHING active, so this is
+        # the only way that failure is ever visible -- judging the active link alone cannot see it.
+        pending_up = (target_ssid, now)
+        prev_active_ssid = target_ssid.lower()
+        # ...and DROP any cached usability for it. DEFENCE IN DEPTH, not the load-bearing fix: with
+        # judge_link keeping a pending link sticky through an unreadable tick regardless of the
+        # cache, nothing consults a stale entry between the raise and its resolution. This keeps a
+        # stale False from mattering if that ever changes. Untested wiring, deliberately kept.
+        _usable_cache.pop(target_ssid.lower(), None)
+
+      # ...and VERIFY it. `up_priority`/`up_fallback` drop the hotspot BEFORE raising the client, so a
+      # failed association leaves the device with no uplink at all. Unverified, the same network would
+      # be picked again next tick (it is still in the scan) and the device would sit offline forever.
+      # Rule 2: the failure is recorded as an EVENT and the network serves an escalating backoff, so
+      # the ladder moves on to the next tier instead of silently retrying the thing that does not work.
 
       # captive-portal auto-accept: when we're sitting on one of OUR SSIDs that declares a portal
       # handler and we don't yet have full connectivity, POST its accept form (once per session).
